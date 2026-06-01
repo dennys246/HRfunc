@@ -278,6 +278,13 @@ class AppState:
     # Typed Any for the same import-graph reason. The Activity panel reads
     # the data + annotations for the lens-style preproc/deconv overlay plot.
     activity_raw: Optional[Any] = None
+    # Scan that produced the current ``activity_raw``. Like
+    # ``montage_source_scan`` for the montage, this exists so the Activity
+    # preview and the Export tab don't overlay/ship scan A's deconvolved Raw
+    # against scan B's data after the user switches the selected scan (the
+    # single ``activity_raw`` slot is not cleared on scan change). Consumers
+    # compare ``activity_source_scan.path`` to the selected scan's path.
+    activity_source_scan: Optional[ScanEntry] = None
     # Per-scan quality metrics (Sprint 4.1). Keyed by ``ScanEntry.path.resolve()``;
     # each value is a dict {"raw": metrics_dict, "preprocessed": metrics_dict,
     # "deconvolved": metrics_dict}. Each metrics_dict contains numeric summaries
@@ -714,9 +721,28 @@ class AppState:
         from inside their callback see the new value. Subscribers themselves
         are not cleared — panels stay subscribed across project switches in
         the single-shell GUI; their handlers re-read state and refresh.
+
+        Per-scan state that is meaningless against a different project is
+        cleared here, not just in ``reset()``: the picker drives every
+        project change (open / switch-to-recent / close) through this
+        method, never through ``reset()``. Without the clear, the previous
+        project's ``selected_scan`` and cached Raws leak into the Inspect
+        panel, and its ``checked_scan_paths`` can silently pre-check (and
+        bulk-include) a colliding path in the new project. A ``scan_selected``
+        None is published so panels keyed only on that event (Inspect) blank
+        themselves. Idempotent: setting the manifest already in place is a
+        no-op so a stray re-set can't wipe a live selection.
         """
+        if manifest is self.manifest:
+            return
         self.manifest = manifest
+        self.selected_scan = None
+        self.raw_cache.clear()
+        self.processed_cache.clear()
+        self.checked_scan_paths.clear()
+        self.bulk_progress = None
         self.publish("project_changed", manifest)
+        self.publish("scan_selected", None)
 
     def reset(self) -> None:
         """Return to the welcome-screen state.
@@ -745,6 +771,7 @@ class AppState:
         self.montage = None
         self.montage_source_scan = None
         self.activity_raw = None
+        self.activity_source_scan = None
         self.quality_metrics.clear()
         # Note: library_hbo / library_hbr are deliberately NOT cleared by
         # reset(). They hold immutable bundled data loaded once per process;
