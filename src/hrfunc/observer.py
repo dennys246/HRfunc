@@ -82,27 +82,31 @@ class lens:
             'Deconvolved': []
         }
 
-        count = 0
         _min = -0.02
         _max = 0.07
-        
+
         for state in ['Preprocessed', 'Deconvolved']:
-            count = 0
+            # Each channel's value is a sum over SUBJECTS, so the per-channel
+            # average divides by the subject count. The previous code divided
+            # by a running (subject x channel) pair count, shrinking every
+            # reported average by a factor of the channel count.
+            n_subjects = len(self.metrics[state]['kurtosis'])
+
             #Add all kurtosis across subjects per channel
             for subject_id, channels in self.metrics[state]['kurtosis'].items():
                 for channel in channels:
                     channel_kurtosis[state][channel] += self.metrics[state]['kurtosis'][subject_id][channel]
-                    count += 1
 
             # Add all skewness across subjects per channel
             for subject_id, channels in self.metrics[state]['skewness'].items():
                 for channel in channels:
                     channel_skewness[state][channel] += self.metrics[state]['skewness'][subject_id][channel]
-            
+
             # Average across subjects for each channel
+            divisor = n_subjects if n_subjects else 1
             for channel in channels:
-                skewness[state].append(channel_skewness[state][channel] / count)
-                kurtosis[state].append(channel_kurtosis[state][channel] / count) 
+                skewness[state].append(channel_skewness[state][channel] / divisor)
+                kurtosis[state].append(channel_kurtosis[state][channel] / divisor)
         
         print(f"Average {state} skew: {sum(skewness[state]) / len(skewness[state])} \nAverage {state} kurtosis: {sum(kurtosis[state]) / len(kurtosis[state])}")
         
