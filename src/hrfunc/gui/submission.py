@@ -266,8 +266,15 @@ class SubmissionMetadata:
         # the dataset.
         if self.dataset_ownership == "no" and not self.dataset_permission.strip():
             missing.append("Dataset Permission")
-        # Conditional: owner + contact only required when permission == yes.
-        if self.dataset_permission == "yes":
+        # Conditional: owner + contact only required when the user does NOT
+        # own the dataset AND has permission. The ownership clause guards
+        # against a stale dataset_permission=="yes" left over from a prior
+        # answer (the form hides these inputs once ownership flips back to
+        # "yes"); without it, missing_required would demand owner/contact for
+        # fields that aren't rendered, stranding the Submit button. The panel
+        # also clears these children on the parent change, so this is
+        # defence in depth.
+        if self.dataset_ownership == "no" and self.dataset_permission == "yes":
             if not self.dataset_owner.strip():
                 missing.append("Dataset Owner Name")
             if not self.dataset_contact.strip():
@@ -536,17 +543,38 @@ def render_submission_panel(state, *, default_path: Optional[Path] = None) -> No
         _text_input(metadata, "doi", "DOI of the paper detailing data collection")
 
         # --- Dataset rights -------------------------------------------
+        # Conditional sub-fields are stamped onto the shared ``metadata`` by
+        # their inputs and are NOT auto-cleared when the parent select hides
+        # them. Without the resets below, flipping a parent back (e.g.
+        # ownership "no" -> "yes") would leave a stale dataset_permission /
+        # owner / contact on metadata: to_form_dict would then POST
+        # contradictory rights metadata, and a stale permission could even
+        # strand Submit on now-hidden required fields. Clear children on the
+        # parent change before refreshing.
+        def _on_ownership_change() -> None:
+            if metadata.dataset_ownership != "no":
+                metadata.dataset_permission = ""
+                metadata.dataset_owner = ""
+                metadata.dataset_contact = ""
+            _body.refresh()
+
+        def _on_permission_change() -> None:
+            if metadata.dataset_permission != "yes":
+                metadata.dataset_owner = ""
+                metadata.dataset_contact = ""
+            _body.refresh()
+
         _section_label("Dataset rights")
         _select_input(
             metadata, "dataset_ownership",
             "Do you own the dataset these HRFs were estimated from?",
-            on_change=_body.refresh,
+            on_change=_on_ownership_change,
         )
         if metadata.dataset_ownership == "no":
             _select_input(
                 metadata, "dataset_permission",
                 "Do you have the owner's permission to add these HRFs to the HRtree?",
-                on_change=_body.refresh,
+                on_change=_on_permission_change,
             )
             if metadata.dataset_permission == "no":
                 with ui.row().classes("items-start gap-2"):
@@ -561,11 +589,19 @@ def render_submission_panel(state, *, default_path: Optional[Path] = None) -> No
                 _text_input(metadata, "dataset_contact", "Dataset owner email")
 
         # --- HRfunc usage ---------------------------------------------
+        # Same stale-child concern as Dataset rights: clear hrfunc_extension
+        # when the user flips back to "yes" so a prior extension summary
+        # isn't silently POSTed for a now-standard submission.
+        def _on_hrfunc_standard_change() -> None:
+            if metadata.hrfunc_standard != "no":
+                metadata.hrfunc_extension = ""
+            _body.refresh()
+
         _section_label("HRfunc usage")
         _select_input(
             metadata, "hrfunc_standard",
             "Did you estimate these HRFs using the unaltered HRfunc library?",
-            on_change=_body.refresh,
+            on_change=_on_hrfunc_standard_change,
         )
         if metadata.hrfunc_standard == "no":
             ui.label(

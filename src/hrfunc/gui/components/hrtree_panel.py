@@ -1884,8 +1884,17 @@ def _render_viz_pane(state: AppState) -> None:
                 # PR #55: also stamp the anchor onto the *active* ROI
                 # slot so it travels with the slot (and into the saved
                 # montage). Pre-PR-#55 the anchor was a single global
-                # field; now each ROI keeps its own.
-                state.active_roi.anchor = anchor_dict
+                # field; now each ROI keeps its own. Since the 2026-05-16
+                # layout refactor cluster_rois defaults to EMPTY, so on a
+                # fresh library load active_roi is None -- guard the stamp
+                # rather than dereferencing None (which aborted the handler
+                # before the selection event published, so the very first
+                # HRF click did nothing visible). The centre-seed proxy
+                # writes and the painted-set clear below already no-op when
+                # there's no active slot.
+                active = state.active_roi
+                if active is not None:
+                    active.anchor = anchor_dict
                 # Seed the Cluster sub-tab's shape centre from the clicked
                 # HRF so sphere mode's behaviour matches the v1.2 "click
                 # an HRF, sphere centres on it" workflow even though the
