@@ -169,7 +169,17 @@ def _render(state: AppState) -> None:
 
     tabs_holder: dict = {}
     _render_toolbar(state, tabs_holder)
-    _render_tab_panels(state, tabs_holder["tabs"], initial_tab)
+    tabs = tabs_holder["tabs"]
+    _render_tab_panels(state, tabs, initial_tab)
+
+    # Let panels request a tab switch without holding a reference to the
+    # ``ui.tabs`` element (and without importing this module, which would be
+    # circular). The Activity tab publishes ``navigate_preprocess`` when the
+    # selected scan hasn't been preprocessed yet, linking the user straight
+    # to the Preprocess tab. Keep the tab-name string solely here.
+    state.subscribe(
+        "navigate_preprocess", lambda *_: tabs.set_value(TAB_PREPROCESS)
+    )
 
 
 # ---------------------------------------------------------------------------
