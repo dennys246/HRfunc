@@ -95,6 +95,25 @@ class RawCache:
             self._cache.popitem(last=False)
         return raw
 
+    def put(
+        self, scan_or_path: Union[ScanEntry, Path, str], raw: "mne.io.BaseRaw"
+    ) -> None:
+        """Insert (or replace) a Raw the caller already holds, honoring LRU.
+
+        Used by callers that produce a Raw themselves rather than loading it
+        through :meth:`get` — e.g. the Preprocess / Quality panels storing a
+        *preprocessed* Raw under its scan path. Writing straight into
+        ``_cache`` (as those sites previously did) bypasses the ``maxsize``
+        eviction that only :meth:`get` performed, so a bulk run could retain
+        every result and grow memory without bound. Routing the writes here
+        enforces the bound in one place. The entry is promoted to MRU.
+        """
+        path = self._extract_path(scan_or_path)
+        self._cache[path] = raw
+        self._cache.move_to_end(path)
+        if len(self._cache) > self.maxsize:
+            self._cache.popitem(last=False)
+
     def evict(self, scan_or_path: Union[ScanEntry, Path, str]) -> bool:
         """Remove a specific entry from the cache.
 

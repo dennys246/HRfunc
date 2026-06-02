@@ -155,6 +155,32 @@ def _render_per_scan(state: AppState, scan: ScanEntry) -> None:
                         ui.label("Working…").classes("text-sm opacity-70")
         else:
             _render_metrics_table(cached)
+            # A cached entry computed BEFORE Activity ran holds only the
+            # raw + preprocessed stages; nothing invalidates it when Activity
+            # later produces a deconvolved Raw for this scan. Offer an
+            # explicit recompute (the panel otherwise only shows the compute
+            # button on the empty branch) so the deconvolved row can be added
+            # without a full project reset.
+            deconv_available = (
+                STAGE_DECONVOLVED not in cached
+                and state.activity_raw is not None
+                and state.montage_source_scan is not None
+                and state.montage_source_scan.path == scan.path
+            )
+            with ui.row().classes("items-center gap-3 mt-2"):
+                recompute_disabled = (
+                    state.busy or scan not in state.processed_cache
+                )
+                ui.button(
+                    "Recompute metrics",
+                    icon="refresh",
+                    on_click=lambda: _run_per_scan(state, scan),
+                ).props(f"flat dense {'disable' if recompute_disabled else ''}")
+                if deconv_available:
+                    ui.label(
+                        "Activity result available — recompute to add the "
+                        "deconvolved row."
+                    ).classes("text-sm opacity-60")
 
 
 def _render_metrics_table(stages_metrics: Dict[str, QualityMetrics]) -> None:
@@ -405,10 +431,9 @@ def compute_dataset_sync(
                 processed_obj = None
             else:
                 if processed_obj is not None:
-                    processed_cache._cache[scan.path.resolve()] = processed_obj
-                    # Honor the LRU bound — _cache is an OrderedDict.
-                    while len(processed_cache._cache) > processed_cache.maxsize:
-                        processed_cache._cache.popitem(last=False)
+                    # put() enforces the LRU bound in one place (was an inline
+                    # direct write + manual popitem loop here).
+                    processed_cache.put(scan, processed_obj)
 
         stages: Dict[str, QualityMetrics] = {}
         stages[STAGE_RAW] = _compute_raw_metrics(raw_obj)
