@@ -65,8 +65,12 @@ def classify_path(path: Union[str, Path]) -> Optional[FormatHit]:
         not contain fNIRS channels.
 
     Notes:
-        - Symlinks are followed via ``Path.resolve`` so callers can pass
-          relative paths from any working directory.
+        - The returned ``FormatHit.path`` is the path AS PASSED (wrapped in a
+          ``Path``); it is not resolved or symlink-followed. Callers that need
+          an absolute/canonical path should resolve before calling (the folder
+          scanner does — it walks an already-resolved root). Resolving here
+          would change ``FormatHit.path``'s shape, which downstream BIDS
+          metadata parsing relies on being root-relative.
         - This function does not raise on bad input. A path that does not
           exist, a directory missing NIRx markers, a non-fNIRS FIF, etc., all
           return None. Errors during the FIF info read are logged and treated

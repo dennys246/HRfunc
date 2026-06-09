@@ -101,8 +101,12 @@ async def run_in_background(
         logger.exception("Background worker failed: %s", exc)
         return None
     finally:
-        state.set_busy(False)
+        # Clear progress BEFORE flipping busy: set_busy(False) synchronously
+        # publishes busy_changed, so a subscriber that re-renders would
+        # otherwise observe busy=False while estimation_progress still holds
+        # the last channel tuple. Matches the bulk worker's finally ordering.
         state.estimation_progress = None
+        state.set_busy(False)
 
     if on_done is not None:
         try:

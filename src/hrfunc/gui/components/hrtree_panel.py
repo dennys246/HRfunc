@@ -255,6 +255,27 @@ def _alignment_for_shape(state: AppState, shape: Optional[Shape]) -> "Optional[n
     return _build_atlas_alignment_affine(state)
 
 
+def _apply_alignment_to_point(
+    point_mm: Tuple[float, float, float],
+    alignment_affine: "Optional[np.ndarray]",
+) -> Tuple[float, float, float]:
+    """Map an MNE-head mm point to MNI mm through the alignment affine.
+
+    Mirrors the per-HRF transform in ``compute_roi_keys_by_shape`` so a
+    single-point lookup (the Cluster centre's "Region at centre" readout)
+    lands in the same frame as the membership check. Returns the point
+    unchanged when there's no affine (sphere/box mode, or atlas mode with
+    no alignment configured), matching the membership path's behaviour.
+    """
+    if alignment_affine is None:
+        return point_mm
+    homo = np.array(
+        [point_mm[0], point_mm[1], point_mm[2], 1.0], dtype=np.float64
+    )
+    aligned = alignment_affine @ homo
+    return (float(aligned[0]), float(aligned[1]), float(aligned[2]))
+
+
 def _build_shape_for_slot(state: AppState, slot) -> Optional[Shape]:
     """Build the spatial-layer Shape for a specific ROI slot.
 
@@ -824,10 +845,24 @@ def _render_cluster_subtab(state: AppState) -> None:
                 # Atlas readout is shown in BOTH modes so sphere users
                 # can see "my centre sits in: Frontal Pole" without
                 # switching modes -- useful navigation aid.
-                region_at_centre = atlas.region_at((
-                    state.cluster_center_x_mm,
-                    state.cluster_center_y_mm,
-                    state.cluster_center_z_mm,
+                #
+                # The centre is stored in MNE-head mm (it's seeded from
+                # clicked HRF locations, which are head-coord). atlas.region_at
+                # expects MNI mm, so apply the same alignment the membership
+                # check uses before the lookup -- otherwise this readout
+                # reports a different (wrong) region than the ROI it sits
+                # above whenever the user has set atlas offsets/affine.
+                # _alignment_for_shape returns None outside atlas mode, so
+                # sphere/box readouts are unchanged.
+                _centre_shape = _build_current_shape(state)
+                _centre_alignment = _alignment_for_shape(state, _centre_shape)
+                region_at_centre = atlas.region_at(_apply_alignment_to_point(
+                    (
+                        state.cluster_center_x_mm,
+                        state.cluster_center_y_mm,
+                        state.cluster_center_z_mm,
+                    ),
+                    _centre_alignment,
                 ))
                 centre_region_text = (
                     f"Region at centre: {region_at_centre}"
@@ -2745,8 +2780,12 @@ def compute_roi_average(
     # First pass: parse every subject-level estimate into a numpy array.
     # Track the source-channel count separately so the UI can show
     # "averaged N subjects across M channels".
-    candidates: List["np.ndarray"] = []
-    contributing_channels = 0
+    # Keep each parsed estimate paired with its source-channel key so the
+    # contributing-channel count can be taken AFTER the modal-length filter
+    # below -- a channel whose estimates are all an off-modal length
+    # contributes zero traces to the mean and must not inflate the reported
+    # "M channels" provenance figure.
+    candidates: List[Tuple[str, "np.ndarray"]] = []
     for key in roi_keys:
         hrf = hrfs.get(key)
         if hrf is None:
@@ -2758,7 +2797,6 @@ def compute_roi_average(
             # rather than fall back to hrf_mean (would mix two
             # averaging conventions in the same output).
             continue
-        added_from_this_channel = False
         for estimate in estimates:
             try:
                 arr = np.asarray(estimate, dtype=float)
@@ -2766,10 +2804,7 @@ def compute_roi_average(
                 continue
             if arr.ndim != 1 or arr.size == 0:
                 continue
-            candidates.append(arr)
-            added_from_this_channel = True
-        if added_from_this_channel:
-            contributing_channels += 1
+            candidates.append((key, arr))
 
     if len(candidates) < 2:
         return None
@@ -2780,13 +2815,15 @@ def compute_roi_average(
     # throw out the majority. Modal length is robust to iteration order
     # and matches what a researcher would expect: "average the traces
     # that share the typical duration; skip the oddball".
-    lengths = Counter(arr.shape[0] for arr in candidates)
+    lengths = Counter(arr.shape[0] for _, arr in candidates)
     canonical_len = lengths.most_common(1)[0][0]
-    traces = [arr for arr in candidates if arr.shape[0] == canonical_len]
+    kept = [(key, arr) for key, arr in candidates if arr.shape[0] == canonical_len]
 
-    if len(traces) < 2:
+    if len(kept) < 2:
         return None
 
+    traces = [arr for _, arr in kept]
+    contributing_channels = len({key for key, _ in kept})
     stacked = np.vstack(traces)
     return (
         stacked.mean(axis=0),

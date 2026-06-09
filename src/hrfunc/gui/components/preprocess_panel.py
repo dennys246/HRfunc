@@ -298,8 +298,9 @@ def _run_pipeline(
         if result is None:
             return
         # run_pipeline_sync wraps the result so we can stash the processed
-        # Raw under the scan path in processed_cache.
-        state.processed_cache._cache[scan.path.resolve()] = result
+        # Raw under the scan path in processed_cache. put() enforces the LRU
+        # bound (a direct _cache write would not).
+        state.processed_cache.put(scan, result)
         state.publish("preprocess_done", scan)
 
     background_tasks.create(
@@ -342,7 +343,9 @@ def _run_pipeline_bulk(
     async def _on_each_done(scan: ScanEntry, result) -> None:
         if result is None:
             return
-        state.processed_cache._cache[scan.path.resolve()] = result
+        # put() enforces the LRU bound; the prior direct _cache write let a
+        # bulk preprocess retain every result and grow memory unbounded.
+        state.processed_cache.put(scan, result)
         state.publish("preprocess_done", scan)
 
     async def _bulk() -> None:

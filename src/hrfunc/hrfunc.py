@@ -641,6 +641,16 @@ class montage(tree):
             # Grab channel optode attached to montage
             optode = self.channels[channel]
 
+            # Skip channels with no estimates: np.mean([], axis=0) is NaN
+            # (poisoning the trace and the global vstack pool) and
+            # update_centroid() indexes a 0-d mean of empty locations, raising
+            # IndexError. Per the subject-weighted averaging convention, HRFs
+            # without estimates are EXCLUDED, not folded in. 'global_*' entries
+            # carry no estimates either, so this also keeps a second
+            # generate_distribution call from re-pooling them.
+            if not optode.estimates:
+                continue
+
             # Calculate average HRF estimate and standard deviation
             optode.trace = np.mean(optode.estimates, axis = 0)
             optode.trace_std = np.std(optode.estimates, axis = 0)
@@ -667,6 +677,11 @@ class montage(tree):
 
         # Calculate global HRF mean and standard deviation
         for oxygenation, estimates in zip([True, False], [hbo_estimates, hbr_estimates]):
+            if not estimates:
+                # No channels of this oxygenation contributed a trace (all
+                # were skipped for lacking estimates). Nothing to pool, and
+                # np.vstack([]) would raise -- skip the global for this type.
+                continue
             type_estimates = np.vstack(estimates)
             global_mean = np.mean(type_estimates, axis = 0)
             global_std = np.std(type_estimates, axis = 0)

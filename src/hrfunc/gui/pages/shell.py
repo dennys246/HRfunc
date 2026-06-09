@@ -380,6 +380,23 @@ def _render_empty_state(state: AppState, *, verb: str) -> None:
         ).classes("text-sm opacity-60")
 
         async def _on_click() -> None:
+            # Gate on busy BEFORE opening the OS dialog. During the very first
+            # project scan the empty-state is still showing (manifest is None)
+            # while busy is True; without this guard the click opens the
+            # folder dialog and then open_project_path -> run_in_background
+            # silently refuses (busy), so the click appears to do nothing.
+            # The picker dropdown disables Open while busy; this second entry
+            # point needs equivalent feedback. Checking here (rather than
+            # disabling the button) also avoids the button staying stuck if an
+            # initial scan fails — busy clears but no project_changed fires to
+            # re-render the empty state.
+            if state.busy:
+                ui.notify(
+                    "A task is still running — wait for it to finish before "
+                    "opening a project.",
+                    type="warning",
+                )
+                return
             path = await dataset_picker.pick_folder()
             if path is None:
                 return
