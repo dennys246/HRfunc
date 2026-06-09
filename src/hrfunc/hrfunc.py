@@ -577,14 +577,29 @@ class montage(tree):
                         False, self.sfreq, canonical_duration
                     )
 
-            # Figure out which channel to apply to
+            # Figure out which channel to apply to. Track the match explicitly:
+            # a bare for/break leaves nirx_channel bound to the LAST iterated
+            # channel when ch_name matches nothing, which would silently apply
+            # this HRF's deconvolution to an unrelated channel. self.channels
+            # can legitimately contain a channel absent from this scan — e.g. a
+            # montage loaded via load_montage (configured=True, so configure()
+            # is skipped), or estimate_activity reused across scans with
+            # differing layouts — so a no-match must skip, not act on a stale
+            # loop variable.
+            matched_channel = None
             for nirx_channel in nirx_obj.info['chs']:
-                standard_ch_name = standardize_name(nirx_channel['ch_name'])
-                if ch_name == standard_ch_name:
+                if ch_name == standardize_name(nirx_channel['ch_name']):
+                    matched_channel = nirx_channel
                     break
+            if matched_channel is None:
+                print(
+                    f"WARNING: channel {ch_name} not found in scan {nirx_obj}; "
+                    "skipping deconvolution for it"
+                )
+                continue
 
             print(f"Deconvolving channel {ch_name}...") # Apply deconvolution
-            nirx_obj.apply_function(deconvolution, picks = [nirx_channel['ch_name']]) # Apply deconvolution for channel
+            nirx_obj.apply_function(deconvolution, picks = [matched_channel['ch_name']]) # Apply deconvolution for channel
 
             # Remove channel if neural activity estimation failed to converge.
             # M4: also drop the orphaned entry from self.channels and the
@@ -596,7 +611,7 @@ class montage(tree):
             # this release iterates the full tree except montage.branch()
             # which rebuilds from self.channels.
             if success is False:
-                nirx_obj.drop_channels([nirx_channel['ch_name']])
+                nirx_obj.drop_channels([matched_channel['ch_name']])
                 dropped_channels.append(ch_name)
 
             # Replace the canonical HRF estimate temporarily used with the HRF estimate
