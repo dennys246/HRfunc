@@ -1,6 +1,6 @@
 """HRfunc GUI entry point.
 
-``hrfunc`` (the CLI command installed by ``pip install hrfunc[gui]``)
+``hrfunc`` (the CLI command installed by ``pip install hrfunc``)
 calls ``main()``, which dispatches three classes of invocation:
 
 1. **Bare launch** (``hrfunc`` or ``hrfunc <path>``) — the dominant path.
@@ -93,9 +93,26 @@ def _launch_gui(argv: List[str]) -> int:
     args = parser.parse_args(argv)
 
     # Import NiceGUI lazily so `hrfunc --version` and `hrfunc --help` work
-    # even if the [gui] extras are not fully installed (e.g. user is checking
-    # what version they have before pip install hrfunc[gui]).
-    from nicegui import ui
+    # even before the heavier GUI imports resolve. The GUI stack is now a
+    # core dependency (see pyproject), so this should always succeed on a
+    # normal install -- but guard it anyway: if the env is broken/partial,
+    # a clear "reinstall" hint beats a raw ModuleNotFoundError traceback for
+    # the non-technical researchers who are the GUI's audience.
+    try:
+        from nicegui import ui
+    except ModuleNotFoundError as exc:
+        if exc.name not in ("nicegui", "plotly", "pywebview", "webview"):
+            raise
+        print(
+            "HRfunc's desktop GUI couldn't start because a required package "
+            f"is missing ({exc.name}). Your install looks incomplete.\n\n"
+            "Reinstall HRfunc to pull the GUI dependencies:\n"
+            "    pip install --force-reinstall hrfunc\n\n"
+            "From a source checkout:\n"
+            "    pip install -e .",
+            file=sys.stderr,
+        )
+        return 1
 
     from .state import state
 

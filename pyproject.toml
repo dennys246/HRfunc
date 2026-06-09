@@ -25,10 +25,13 @@ dependencies = [
     "nilearn",
     "matplotlib",
     "platformdirs>=3.0",
-    ]
-
-[project.optional-dependencies]
-gui = [
+    # GUI stack. The `hrfunc` command IS the desktop GUI, so these are
+    # core dependencies rather than an optional extra -- a plain
+    # `pip install hrfunc` must give a working app, since the target
+    # users are researchers who launch HRfunc as a desktop program and
+    # shouldn't have to know about pip extras. (Was a `[gui]` extra
+    # pre-1.3.x; promoted to core so `hrfunc` never fails with a bare
+    # ModuleNotFoundError on a default install.)
     "nicegui>=2.0",
     "plotly>=5.18",
     "pywebview>=5.0",
@@ -39,6 +42,14 @@ gui = [
     # shortcut install doesn't depend on transitive coincidence.
     "Pillow>=9.0",
     ]
+
+[project.optional-dependencies]
+# The GUI stack moved into core `dependencies` (above), so installing the
+# GUI no longer needs an extra. This empty `gui` extra is kept purely so
+# existing instructions / scripts that run `pip install hrfunc[gui]`
+# don't error on an unknown extra -- it resolves to the (already core)
+# GUI deps as a no-op.
+gui = []
 
 [project.scripts]
 hrfunc = "hrfunc.gui.app:main"
