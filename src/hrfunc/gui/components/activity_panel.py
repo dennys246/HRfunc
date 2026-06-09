@@ -333,9 +333,23 @@ def _render_run_row(
         if state.busy:
             _render_busy_progress(state)
         elif not bulk_mode and scan is not None and scan not in state.processed_cache:
-            ui.label("Waiting for preprocess output…").classes(
-                "text-sm opacity-60"
-            )
+            # Activity deconvolution runs on the *preprocessed* signal, so
+            # the Run button is disabled until the scan has been through the
+            # Preprocess tab. Spell that out and link straight there rather
+            # than leaving a disabled button with no explanation. The link
+            # goes through the event bus (navigate_preprocess) so this panel
+            # doesn't need a reference to the shell's tab control.
+            with ui.row().classes("items-center gap-2"):
+                ui.icon("info").classes("text-amber-500")
+                ui.label(
+                    "This scan hasn't been preprocessed yet — activity is "
+                    "estimated from the preprocessed signal."
+                ).classes("text-sm opacity-70")
+                ui.button(
+                    "Go to Preprocess",
+                    icon="arrow_forward",
+                    on_click=lambda: state.publish("navigate_preprocess"),
+                ).props("flat dense color=primary")
 
     if state.last_error and not state.busy:
         with ui.row().classes("items-center gap-2"):
