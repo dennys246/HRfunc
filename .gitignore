@@ -183,3 +183,6 @@ build/
 # HRFunc ignore files
 **/._*
 databases/
+
+# macOS Finder metadata (a bare name matches at every depth)
+.DS_Store
