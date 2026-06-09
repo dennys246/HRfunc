@@ -108,13 +108,29 @@ def _render_body(state: AppState) -> None:
             on_click=lambda: _save_processed(state, scan),
         )
 
-        # ── Activity Raw
+        # ── Activity Raw. Gate on the activity result belonging to the
+        # selected scan: activity_raw is a single global slot not cleared on
+        # scan change, so without this the row would offer to save scan A's
+        # deconvolved data under a "<scanB>_activity.snirf" name with a
+        # dropped-channel count computed against scan B's baseline. Gating on
+        # the match means `scan` here IS the source scan, so the filename and
+        # source-count in _save_activity are correct by construction.
+        activity_matches = (
+            state.activity_raw is not None
+            and state.activity_source_scan is not None
+            and state.activity_source_scan.path == scan.path
+        )
         _render_row(
             "Activity Raw",
             "Deconvolved neural-activity output of the Activity tab. Saves "
             "as SNIRF or FIF.",
-            available=(state.activity_raw is not None),
-            unavailable_hint="Run the Activity tab first.",
+            available=activity_matches,
+            unavailable_hint=(
+                "Run the Activity tab on this scan first."
+                if state.activity_raw is None
+                else "The in-memory activity result is from another scan — "
+                "re-run the Activity tab on this scan."
+            ),
             button_label="Save activity scan…",
             on_click=lambda: _save_activity(state, scan),
         )

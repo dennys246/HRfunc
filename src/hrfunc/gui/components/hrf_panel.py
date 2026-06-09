@@ -805,6 +805,23 @@ def _render_hrf_preview(
         ui.image(png).classes("max-w-3xl")
         return
 
+    # Toeplitz montages are scan-specific (the library matches by channel
+    # name, not scan identity), so a montage estimated from scan A must not
+    # be plotted under scan B's header. Selecting a new scan does NOT clear
+    # state.montage, so guard the gallery the same way the Activity panel
+    # guards its run — by comparing montage_source_scan to the selected scan.
+    source = state.montage_source_scan
+    if source is None or source.path != scan.path:
+        source_name = (
+            source.display_name or source.path.name
+            if source is not None else "another scan"
+        )
+        ui.label(
+            f"These HRFs were estimated from {source_name}. "
+            "Re-run estimation on this scan to preview them here."
+        ).classes("text-sm opacity-60")
+        return
+
     _render_toeplitz_gallery(state, result)
 
 

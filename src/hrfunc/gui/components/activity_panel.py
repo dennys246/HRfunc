@@ -167,8 +167,18 @@ def _render_body(state: AppState, opts: ActivityOptions) -> None:
         # ── Run row + progress + errors
         _render_run_row(state, scan, checked_scans, opts)
 
-        # ── Preview (single-scan only -- bulk overwrites activity_raw)
-        if state.activity_raw is not None and not bulk_mode:
+        # ── Preview (single-scan only -- bulk overwrites activity_raw).
+        # Gate on activity_source_scan: activity_raw is a single global slot
+        # that is NOT cleared when the selected scan changes, so without this
+        # check the preview overlays scan A's deconvolved Raw against scan B's
+        # preprocessed Raw (channel names overlap across a shared montage, so
+        # the mismatch renders silently rather than erroring).
+        activity_matches = (
+            scan is not None
+            and state.activity_source_scan is not None
+            and state.activity_source_scan.path == scan.path
+        )
+        if state.activity_raw is not None and activity_matches and not bulk_mode:
             ui.separator()
             ui.label("Deconvolved preview").classes(
                 "text-xs uppercase opacity-60 tracking-wide"
@@ -441,6 +451,7 @@ def _run_bulk(
         if result is None:
             return
         state.activity_raw = result
+        state.activity_source_scan = scan
         state.publish("activity_estimated", scan)
 
     async def _bulk() -> None:
@@ -523,6 +534,7 @@ def _run(
         if result is None:
             return
         state.activity_raw = result
+        state.activity_source_scan = scan
         state.publish("activity_estimated", scan)
 
     background_tasks.create(
