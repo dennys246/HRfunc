@@ -85,6 +85,7 @@ earlier sprints don't need updates as later panels land.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -95,6 +96,12 @@ from ..io.raw_cache import RawCache
 logger = logging.getLogger(__name__)
 
 EventCallback = Callable[..., None]
+
+# Matches the auto-generated ROI slot names ("ROI 1", "ROI 2", ...) that
+# ``add_roi`` / the default factory produce. Used by ``clear_active_roi`` to
+# renumber ONLY auto-named slots after a delete, leaving descriptive names
+# ("Montage: S1_D1" from Add Montage, or user renames) untouched.
+_AUTO_ROI_NAME_RE = re.compile(r"^ROI \d+$")
 
 
 @dataclass
@@ -646,10 +653,17 @@ class AppState:
             self.cluster_active_index = max(
                 0, self.cluster_active_index - 1
             )
-            # Renumber default names so the list stays
-            # "ROI 1 ... ROI N" in order.
-            for i, slot in enumerate(self.cluster_rois):
-                slot.name = f"ROI {i + 1}"
+            # Renumber ONLY auto-generated "ROI N" names so the auto-named
+            # slots stay "ROI 1 ... ROI N" in order. Descriptive names --
+            # "Montage: S1_D1" from Add Montage, or a user rename -- are left
+            # untouched. The pre-fix code overwrote EVERY name on any delete,
+            # which clobbered montage provenance and corrupted the saved
+            # montage.json (build_roi_entry reads slot.name verbatim).
+            auto_index = 0
+            for slot in self.cluster_rois:
+                if _AUTO_ROI_NAME_RE.match(slot.name):
+                    auto_index += 1
+                    slot.name = f"ROI {auto_index}"
         else:
             self.cluster_active_index = 0
 
