@@ -481,16 +481,23 @@
         "sfreq": 7.8125,
         "context": {
             "method": "toeplitz",
-            "doi": "temp",
-            "study": null,
-            "task": null,
-            "conditions": null,
-            "stimulus": null,
+            "doi": "10.1117/1.NPh.13.S1.S17801",
+            "study": "Parent-Child Anxiety Transmission Study (P-CAT)",
+            "task": "flanker",
+            "conditions": [
+                "congruent",
+                "incongruent",
+                "baseline"
+            ],
+            "stimulus": "directional flanker images",
             "intensity": null,
             "duration": 30.0,
-            "protocol": null,
-            "age_range": null,
-            "demographics": null
+            "protocol": "block design",
+            "age_range": [
+                4,
+                7
+            ],
+            "demographics": "children aged 4-7 (n=79)"
         },
         "estimates": [
             [
@@ -11583,16 +11590,23 @@
         "sfreq": 7.8125,
         "context": {
             "method": "toeplitz",
-            "doi": "temp",
-            "study": null,
-            "task": null,
-            "conditions": null,
-            "stimulus": null,
+            "doi": "10.1117/1.NPh.13.S1.S17801",
+            "study": "Parent-Child Anxiety Transmission Study (P-CAT)",
+            "task": "flanker",
+            "conditions": [
+                "congruent",
+                "incongruent",
+                "baseline"
+            ],
+            "stimulus": "directional flanker images",
             "intensity": null,
             "duration": 30.0,
-            "protocol": null,
-            "age_range": null,
-            "demographics": null
+            "protocol": "block design",
+            "age_range": [
+                4,
+                7
+            ],
+            "demographics": "children aged 4-7 (n=79)"
         },
         "estimates": [
             [
@@ -22685,16 +22699,23 @@
         "sfreq": 7.8125,
         "context": {
             "method": "toeplitz",
-            "doi": "temp",
-            "study": null,
-            "task": null,
-            "conditions": null,
-            "stimulus": null,
+            "doi": "10.1117/1.NPh.13.S1.S17801",
+            "study": "Parent-Child Anxiety Transmission Study (P-CAT)",
+            "task": "flanker",
+            "conditions": [
+                "congruent",
+                "incongruent",
+                "baseline"
+            ],
+            "stimulus": "directional flanker images",
             "intensity": null,
             "duration": 30.0,
-            "protocol": null,
-            "age_range": null,
-            "demographics": null
+            "protocol": "block design",
+            "age_range": [
+                4,
+                7
+            ],
+            "demographics": "children aged 4-7 (n=79)"
         },
         "estimates": [
             [
@@ -33787,16 +33808,23 @@
         "sfreq": 7.8125,
         "context": {
             "method": "toeplitz",
-            "doi": "temp",
-            "study": null,
-            "task": null,
-            "conditions": null,
-            "stimulus": null,
+            "doi": "10.1117/1.NPh.13.S1.S17801",
+            "study": "Parent-Child Anxiety Transmission Study (P-CAT)",
+            "task": "flanker",
+            "conditions": [
+                "congruent",
+                "incongruent",
+                "baseline"
+            ],
+            "stimulus": "directional flanker images",
             "intensity": null,
             "duration": 30.0,
-            "protocol": null,
-            "age_range": null,
-            "demographics": null
+            "protocol": "block design",
+            "age_range": [
+                4,
+                7
+            ],
+            "demographics": "children aged 4-7 (n=79)"
         },
         "estimates": [
             [
@@ -44889,16 +44917,23 @@
         "sfreq": 7.8125,
         "context": {
             "method": "toeplitz",
-            "doi": "temp",
-            "study": null,
-            "task": null,
-            "conditions": null,
-            "stimulus": null,
+            "doi": "10.1117/1.NPh.13.S1.S17801",
+            "study": "Parent-Child Anxiety Transmission Study (P-CAT)",
+            "task": "flanker",
+            "conditions": [
+                "congruent",
+                "incongruent",
+                "baseline"
+            ],
+            "stimulus": "directional flanker images",
             "intensity": null,
             "duration": 30.0,
-            "protocol": null,
-            "age_range": null,
-            "demographics": null
+            "protocol": "block design",
+            "age_range": [
+                4,
+                7
+            ],
+            "demographics": "children aged 4-7 (n=79)"
         },
         "estimates": [
             [
@@ -55991,16 +56026,23 @@
         "sfreq": 7.8125,
         "context": {
             "method": "toeplitz",
-            "doi": "temp",
-            "study": null,
-            "task": null,
-            "conditions": null,
-            "stimulus": null,
+            "doi": "10.1117/1.NPh.13.S1.S17801",
+            "study": "Parent-Child Anxiety Transmission Study (P-CAT)",
+            "task": "flanker",
+            "conditions": [
+                "congruent",
+                "incongruent",
+                "baseline"
+            ],
+            "stimulus": "directional flanker images",
             "intensity": null,
             "duration": 30.0,
-            "protocol": null,
-            "age_range": null,
-            "demographics": null
+            "protocol": "block design",
+            "age_range": [
+                4,
+                7
+            ],
+            "demographics": "children aged 4-7 (n=79)"
         },
         "estimates": [
             [
@@ -67093,16 +67135,23 @@
         "sfreq": 7.8125,
         "context": {
             "method": "toeplitz",
-            "doi": "temp",
-            "study": null,
-            "task": null,
-            "conditions": null,
-            "stimulus": null,
+            "doi": "10.1117/1.NPh.13.S1.S17801",
+            "study": "Parent-Child Anxiety Transmission Study (P-CAT)",
+            "task": "flanker",
+            "conditions": [
+                "congruent",
+                "incongruent",
+                "baseline"
+            ],
+            "stimulus": "directional flanker images",
             "intensity": null,
             "duration": 30.0,
-            "protocol": null,
-            "age_range": null,
-            "demographics": null
+            "protocol": "block design",
+            "age_range": [
+                4,
+                7
+            ],
+            "demographics": "children aged 4-7 (n=79)"
         },
         "estimates": [
             [
@@ -78195,16 +78244,23 @@
         "sfreq": 7.8125,
         "context": {
             "method": "toeplitz",
-            "doi": "temp",
-            "study": null,
-            "task": null,
-            "conditions": null,
-            "stimulus": null,
+            "doi": "10.1117/1.NPh.13.S1.S17801",
+            "study": "Parent-Child Anxiety Transmission Study (P-CAT)",
+            "task": "flanker",
+            "conditions": [
+                "congruent",
+                "incongruent",
+                "baseline"
+            ],
+            "stimulus": "directional flanker images",
             "intensity": null,
             "duration": 30.0,
-            "protocol": null,
-            "age_range": null,
-            "demographics": null
+            "protocol": "block design",
+            "age_range": [
+                4,
+                7
+            ],
+            "demographics": "children aged 4-7 (n=79)"
         },
         "estimates": [
             [
@@ -78934,16 +78990,23 @@
         "sfreq": 7.8125,
         "context": {
             "method": "toeplitz",
-            "doi": "temp",
-            "study": null,
-            "task": null,
-            "conditions": null,
-            "stimulus": null,
+            "doi": "10.1117/1.NPh.13.S1.S17801",
+            "study": "Parent-Child Anxiety Transmission Study (P-CAT)",
+            "task": "flanker",
+            "conditions": [
+                "congruent",
+                "incongruent",
+                "baseline"
+            ],
+            "stimulus": "directional flanker images",
             "intensity": null,
             "duration": 30.0,
-            "protocol": null,
-            "age_range": null,
-            "demographics": null
+            "protocol": "block design",
+            "age_range": [
+                4,
+                7
+            ],
+            "demographics": "children aged 4-7 (n=79)"
         },
         "estimates": [
             [
@@ -90036,16 +90099,23 @@
         "sfreq": 7.8125,
         "context": {
             "method": "toeplitz",
-            "doi": "temp",
-            "study": null,
-            "task": null,
-            "conditions": null,
-            "stimulus": null,
+            "doi": "10.1117/1.NPh.13.S1.S17801",
+            "study": "Parent-Child Anxiety Transmission Study (P-CAT)",
+            "task": "flanker",
+            "conditions": [
+                "congruent",
+                "incongruent",
+                "baseline"
+            ],
+            "stimulus": "directional flanker images",
             "intensity": null,
             "duration": 30.0,
-            "protocol": null,
-            "age_range": null,
-            "demographics": null
+            "protocol": "block design",
+            "age_range": [
+                4,
+                7
+            ],
+            "demographics": "children aged 4-7 (n=79)"
         },
         "estimates": [
             [
@@ -101138,16 +101208,23 @@
         "sfreq": 7.8125,
         "context": {
             "method": "toeplitz",
-            "doi": "temp",
-            "study": null,
-            "task": null,
-            "conditions": null,
-            "stimulus": null,
+            "doi": "10.1117/1.NPh.13.S1.S17801",
+            "study": "Parent-Child Anxiety Transmission Study (P-CAT)",
+            "task": "flanker",
+            "conditions": [
+                "congruent",
+                "incongruent",
+                "baseline"
+            ],
+            "stimulus": "directional flanker images",
             "intensity": null,
             "duration": 30.0,
-            "protocol": null,
-            "age_range": null,
-            "demographics": null
+            "protocol": "block design",
+            "age_range": [
+                4,
+                7
+            ],
+            "demographics": "children aged 4-7 (n=79)"
         },
         "estimates": [
             [

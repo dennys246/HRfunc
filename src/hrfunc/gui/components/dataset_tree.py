@@ -235,6 +235,11 @@ def render(
         # Re-render so the Select-all checkbox indeterminate / checked
         # display tracks the new set without waiting on another event.
         _tree_body.refresh()
+        # Notify the action panels so they recompute bulk mode — without
+        # this, ticking scans never makes them eligible for a bulk
+        # Preprocess / HRF / Activity run (the panels only re-render on
+        # their subscribed events, none of which fired on a tick).
+        state.publish("checked_changed", state.checked_scan_paths)
 
     @ui.refreshable
     def _tree_body() -> None:
@@ -271,6 +276,7 @@ def render(
                     state.checked_scan_paths - visible_paths
                 )
             _tree_body.refresh()
+            state.publish("checked_changed", state.checked_scan_paths)
 
         n_checked = sum(
             1 for p in visible_paths if p in state.checked_scan_paths
@@ -322,6 +328,17 @@ def render(
         on_change=_on_filter_change,
     ).props("dense clearable").classes("w-full")
     _tree_body()
+
+    # Cross-tab sync: each data tab (Preprocess / HRFs / Activity) mounts its
+    # OWN dataset tree, but they all share ``state.checked_scan_paths``. When
+    # one tab changes the checked set (tick / select-all here, or a panel that
+    # clears it), the other tabs' trees must re-render their visual ticks or
+    # they drift — e.g. the Activity bulk label reads "2 selected" while this
+    # tab's checkboxes show none. Refresh on ``checked_changed`` so every tree
+    # reflects the shared set. ``_tree_body.refresh()`` rebuilds the tree and
+    # re-applies ticks from state; programmatic ``tree.tick()`` does not emit
+    # ``on_tick``, so this can't loop with the tree that published the event.
+    state.subscribe("checked_changed", lambda _p=None: _tree_body.refresh())
 
 
 def find_scan(manifest: Optional[Manifest], path_id: str) -> Optional[ScanEntry]:

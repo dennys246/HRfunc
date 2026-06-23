@@ -40,7 +40,14 @@ from typing import TYPE_CHECKING, Dict, Optional
 from nicegui import background_tasks, ui
 
 from ..state import AppState
-from ..workers import run_bulk_in_background, run_in_background
+from ..workers import (
+    capture_client,
+    client_scope,
+    notify_if_alive,
+    run_bulk_in_background,
+    run_in_background,
+    summarize_failures,
+)
 from ...io.manifest import ScanEntry
 
 if TYPE_CHECKING:
@@ -82,8 +89,13 @@ def render(state: AppState) -> None:
     """
 
     # Holder for the toggles — updated by ui.switch on_change handlers and
-    # consumed by the click handler when Run is pressed.
-    opts = PreprocessOptions()
+    # consumed by the click handler when Run is pressed. The GUI defaults to
+    # DECONVOLUTION mode: it's the pipeline HRF / activity estimation
+    # requires, and the dominant use of this app. Users can toggle it off
+    # for plain haemoglobin (GLM) preprocessing, but then the HRFs / Activity
+    # tabs will ask them to re-preprocess in deconvolution mode. (The library
+    # PreprocessOptions default stays GLM; this is a GUI-workflow default.)
+    opts = PreprocessOptions(deconvolution=True)
 
     @ui.refreshable
     def _body() -> None:
@@ -97,6 +109,62 @@ def render(state: AppState) -> None:
     state.subscribe("scan_selected", _refresh)
     state.subscribe("scan_loaded", _refresh)
     state.subscribe("preprocess_done", _refresh)
+    # Recompute bulk mode when the dataset-tree checked set changes.
+    state.subscribe("checked_changed", _refresh)
+
+
+def _record_deconvolved(state: AppState, scan, deconvolution: bool) -> None:
+    """Track whether a scan's cached processed Raw came from the
+    deconvolution pipeline. HRF / activity estimation gate on this — a
+    GLM/hemoglobin preprocess (deconvolution=False) is removed from the set
+    so estimation refuses it until re-preprocessed in deconvolution mode."""
+    key = scan.path.resolve()
+    if deconvolution:
+        state.processed_deconvolved.add(key)
+    else:
+        state.processed_deconvolved.discard(key)
+
+
+def ensure_deconvolved_raw(state: AppState, scan):
+    """Return a deconvolution-preprocessed Raw for ``scan``, preprocessing on
+    demand if one isn't already cached.
+
+    Lets a bulk HRF / Activity run TRIGGER the preprocessing each scan needs
+    instead of skipping un-preprocessed scans. Runs synchronously (call from
+    a worker thread). Returns the processed Raw.
+
+    Raises ``RuntimeError`` (never returns None) with a specific reason when
+    the scan can't be made ready — the source file won't load, or the
+    deconvolution pipeline yields nothing. Raising rather than returning None
+    is deliberate: the bulk worker turns the exception into a per-scan failure
+    with this message, so the user sees *why* a scan dropped out instead of a
+    silent skip counted as success.
+
+    Reuse rule: a scan already preprocessed in deconvolution mode is returned
+    from cache as-is; a scan that's missing OR was GLM-preprocessed is
+    (re)run through the deconvolution pipeline so estimation gets valid input.
+    """
+    key = scan.path.resolve()
+    if scan in state.processed_cache and key in state.processed_deconvolved:
+        return state.processed_cache.get(scan)
+    try:
+        raw = state.raw_cache.get(scan)
+    except Exception as exc:  # noqa: BLE001 — bad/missing source file
+        logger.warning("ensure_deconvolved_raw: load failed for %s: %s",
+                       getattr(scan, "path", scan), exc)
+        raise RuntimeError(
+            f"could not load source file ({type(exc).__name__}: {exc})"
+        ) from exc
+    result = run_pipeline_sync(raw, PreprocessOptions(deconvolution=True))
+    if result is None:
+        raise RuntimeError(
+            "deconvolution preprocessing produced no output — the scan may "
+            "have no fNIRS channels, or every channel was dropped by the "
+            "pipeline (check the source file and montage)"
+        )
+    state.processed_cache._cache[key] = result
+    _record_deconvolved(state, scan, True)
+    return result
 
 
 def _resolve_checked_scans(state: AppState) -> list:
@@ -299,8 +367,11 @@ def _run_pipeline(
             return
         # run_pipeline_sync wraps the result so we can stash the processed
         # Raw under the scan path in processed_cache. put() enforces the LRU
-        # bound (a direct _cache write would not).
+        # bound (a direct _cache write would not). _record_deconvolved tracks
+        # whether this was a deconvolution-mode preprocess (the activity gate
+        # reads it).
         state.processed_cache.put(scan, result)
+        _record_deconvolved(state, scan, snapshot.deconvolution)
         state.publish("preprocess_done", scan)
 
     background_tasks.create(
@@ -342,34 +413,42 @@ def _run_pipeline_bulk(
 
     async def _on_each_done(scan: ScanEntry, result) -> None:
         if result is None:
-            return
-        # put() enforces the LRU bound; the prior direct _cache write let a
-        # bulk preprocess retain every result and grow memory unbounded.
+            # Counted as a failure (raising moves it to the failures bucket)
+            # so an empty pipeline result isn't silently scored as success.
+            raise RuntimeError(
+                "preprocessing produced no output — no fNIRS channels "
+                "survived the pipeline"
+            )
+        # put() enforces the LRU bound (the prior direct _cache write let a
+        # bulk preprocess retain every result and grow memory unbounded).
         state.processed_cache.put(scan, result)
+        _record_deconvolved(state, scan, snapshot.deconvolution)
         state.publish("preprocess_done", scan)
 
+    client = capture_client()
+
     async def _bulk() -> None:
-        bulk_result = await run_bulk_in_background(
-            state,
-            scans,
-            _build,
-            on_each_done=_on_each_done,
-            label="preprocess",
-        )
+        with client_scope(client):
+            bulk_result = await run_bulk_in_background(
+                state,
+                scans,
+                _build,
+                on_each_done=_on_each_done,
+                label="preprocess",
+            )
         if bulk_result is None:
             return
         successes, failures = bulk_result
         n_ok, n_fail = len(successes), len(failures)
         summary = f"Preprocessed {n_ok}/{n_ok + n_fail} scan(s)."
         if failures:
-            fail_names = ", ".join(
-                s.display_name or s.path.name for s, _ in failures[:3]
-            )
-            if len(failures) > 3:
-                fail_names += f" (+{len(failures) - 3} more)"
-            summary += f" Failed: {fail_names}."
-        ui.notify(
-            summary, type="positive" if n_fail == 0 else "warning"
+            summary += f" Failed: {summarize_failures(failures)}"
+        # Guarded: the page client may have been deleted during a long run.
+        notify_if_alive(
+            client, summary,
+            type="positive" if n_fail == 0 else "warning",
+            multi_line=True,
+            close_button=True,
         )
 
     background_tasks.create(_bulk())

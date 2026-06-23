@@ -250,12 +250,14 @@ async def _save_processed(state: AppState, scan) -> None:
         ui.notify(state.last_error, type="negative")
 
 
-async def _save_activity(state: AppState, scan) -> None:
+async def _save_activity(state: AppState, scan, naming=None) -> None:
     if state.activity_raw is None:
         state.last_error = "No activity scan available."
         return
+    postfix = (naming or {}).get("postfix", "_deconvolved")
+    ext = (naming or {}).get("ext", ".snirf")
     path = await _pick_save_path(
-        suggested=f"{scan.path.stem}_activity.snirf",
+        suggested=f"{scan.path.stem}{postfix}{ext}",
         title="Save activity scan",
     )
     if path is None:
@@ -358,15 +360,24 @@ async def _save_quality_csv(state: AppState) -> None:
 def _save_raw(raw: "mne.io.BaseRaw", path: Path) -> None:
     """Save an MNE Raw to SNIRF or FIF based on file extension.
 
-    MNE doesn't expose a single ``raw.save()`` that handles both formats;
-    ``mne.export.export_raw`` does SNIRF and the Raw's own ``.save()`` does
-    FIF. Dispatch on extension.
+    Core MNE has no SNIRF writer (``mne.export.export_raw`` only supports
+    bdf / brainvision / edf / eeglab, and ``read_raw_snirf`` is read-only),
+    so SNIRF is written via ``mne_nirs.io.write_raw_snirf`` (h5py opens the
+    file in "w" mode, so it overwrites). FIF uses the Raw's own ``.save()``.
+    Dispatch on extension.
     """
     raw.load_data()
     suffix = path.suffix.lower()
     if suffix == ".snirf":
-        import mne
-        mne.export.export_raw(str(path), raw, fmt="snirf", overwrite=True)
+        try:
+            from mne_nirs.io import write_raw_snirf
+        except Exception as exc:  # noqa: BLE001 — mne-nirs not installed
+            raise RuntimeError(
+                "SNIRF export needs the 'mne-nirs' package "
+                f"({type(exc).__name__}: {exc}). Install mne-nirs or save as "
+                ".fif instead."
+            ) from exc
+        write_raw_snirf(raw, str(path))
     elif suffix == ".fif":
         raw.save(str(path), overwrite=True, verbose="ERROR")
     else:

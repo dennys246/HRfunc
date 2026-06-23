@@ -1,4 +1,5 @@
 import scipy.linalg, scipy.stats, json, mne, random, re, os, nilearn, time
+from types import SimpleNamespace
 import numpy as np
 import matplotlib.pyplot as plt
 from .hrtree import tree, HRF, _flatten_context_value
@@ -324,7 +325,7 @@ class montage(tree):
         
         return estimate
 
-    def estimate_hrf(self, nirx_obj, events, duration = 30.0, lmbda = 1e-3, edge_expansion = 0.15, preprocess = True, progress_callback = None):
+    def estimate_hrf(self, nirx_obj, events, duration = 30.0, lmbda = 1e-3, edge_expansion = 0.15, preprocess = True, progress_callback = None, timeout = 30):
         """
         Estimate an HRF subject wise given a nirx object and event impulse series using toeplitz
         deconvolution with regularization.
@@ -342,6 +343,10 @@ class montage(tree):
                 channel_name is the standardized form (matching self.channels keys) so callers
                 see the same naming convention as estimate_activity. Used by GUI/batch tooling to
                 surface progress; exceptions raised by the callback propagate. Default None (no-op).
+            timeout (float) - Seconds to wait for a single channel's lstsq solve before skipping
+                that channel's estimate (the channel contributes no estimate and estimation
+                continues with the rest). Default 30 — a generous ceiling that fires only on
+                pathological matrices.
 
         Returns:
             None
@@ -420,7 +425,25 @@ class montage(tree):
             lhs = X.T @ X + lmbda * np.eye(X.shape[1])
             rhs = X.T @ Y
 
-            hrf_estimate = self.solve_lstsq(lhs, rhs)
+            # Solve with a per-channel timeout so one pathological channel
+            # can't hang the whole estimation; on timeout / solve failure the
+            # channel is skipped (contributes no estimate) and we move on.
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(self.solve_lstsq, lhs, rhs)
+                try:
+                    hrf_estimate = future.result(timeout)
+                except TimeoutError:
+                    print(
+                        f"HRF solve exceeded {timeout}s timeout for channel "
+                        f"{channel['ch_name']}; skipping channel"
+                    )
+                    continue
+                except Exception as exc:
+                    print(
+                        f"HRF solve failed for channel {channel['ch_name']}: "
+                        f"{type(exc).__name__}: {exc}; skipping channel"
+                    )
+                    continue
 
             # Denormalize HRF estimate
             #hrf_estimate = hrf_estimate * np.max(np.abs(fnirs_signal))
@@ -439,7 +462,7 @@ class montage(tree):
             optode.locations.append(list(channel['loc'][:3]))
 
 
-    def estimate_activity(self, nirx_obj, lmbda = 1e-4, hrf_model = 'toeplitz', preprocess = True, cond_thresh = None, timeout = 30, progress_callback = None):
+    def estimate_activity(self, nirx_obj, lmbda = 1e-4, hrf_model = 'toeplitz', preprocess = True, cond_thresh = None, timeout = 30, progress_callback = None, library_trace = None, library_oxygenation = True, drop_failed_channels = True):
         """
         Deconvlve a fNIRS scan using estimated HRF's localized to optodes location
         to gain a neural activity estimate
@@ -447,9 +470,24 @@ class montage(tree):
         Arguments:
             nirx_obj (mne raw object) - fNIRS scan loaded through mne
             lmbda (float) - Regularization parameter to apply during deconvolution
-            hrf_model (str) - HRF model to use during deconvolution, either 'toeplitz' for localized HRF's or 'canonical' for a standard canonical HRF
+            hrf_model (str) - HRF model to use during deconvolution: 'toeplitz' for the montage's
+                localized per-channel HRF's, 'canonical' for a standard SPM canonical HRF, or
+                'library' to deconvolve every channel with a single HRF trace supplied in
+                ``library_trace`` (e.g. one selected from the HRtree spatial database)
+            library_trace (sequence of float or None) - 1D HRF kernel used for every channel when
+                hrf_model='library'. Required (and must not be all-zero) in that mode; ignored
+                otherwise. The trace is applied as given to channels whose oxygenation matches
+                ``library_oxygenation`` and sign-flipped for the opposite oxygenation (HbO and HbR
+                responses are inverses).
+            library_oxygenation (bool) - Oxygenation the supplied ``library_trace`` was measured at
+                (True = HbO, False = HbR). Used only when hrf_model='library' to orient the kernel
+                per channel. Default True.
             preprocess (bool) - If True, preprocess the fNIRS data before estimating the neural activity
             cond_thresh (float or None) - Condition number threshold for falling back to pinv in solve_lstsq
+            drop_failed_channels (bool) - If True (default), a channel that errors at any point of
+                deconvolution (solve timeout, singular matrix, malformed input, etc.) is dropped and
+                the scan continues with its surviving channels. If False, the first channel failure
+                raises and aborts the whole scan (all-or-nothing). Default True.
             timeout (float) - Seconds to wait for a single channel's lstsq solve before dropping that channel.
                 Default 30 is a generous ceiling — realistic fNIRS inputs solve in tens of milliseconds,
                 so this fires only on genuinely pathological matrices. Can be tightened once empirical
@@ -466,6 +504,17 @@ class montage(tree):
 
         if lmbda <= 0:
             raise ValueError(f"ERROR: lmbda must be > 0 for Tikhonov regularization, got {lmbda}")
+
+        # Library mode deconvolves every channel with one supplied HRF trace
+        # (e.g. an HRtree selection). Validate + normalize it once up front so
+        # the per-channel loop just orients it by oxygenation.
+        library_kernel = None
+        if hrf_model == 'library':
+            if library_trace is None or len(library_trace) == 0:
+                raise ValueError("ERROR: hrf_model='library' requires a non-empty library_trace")
+            library_kernel = np.asarray(library_trace, dtype=np.float64)
+            if np.max(np.abs(library_kernel)) == 0:
+                raise ValueError("ERROR: library_trace is all zeros; cannot deconvolve")
 
         # Check montage still needs to be configured
         if self.configured is False:
@@ -493,39 +542,65 @@ class montage(tree):
             Y = (nirx - mean) / std
             Y = np.asarray(Y, dtype=float)
 
-            # Pad HRF to match nirx length
+            # Normalize the HRF kernel
             hrf_kernel = hrf.trace / np.max(np.abs(hrf.trace))
             hrf_kernel = np.asarray(hrf_kernel, dtype=float)
 
-            # Construct Toeplitz convolution matrix (design matrix)
             n_time = len(Y)
-            n_hrf = len(hrf_kernel)
+            n_hrf = min(len(hrf_kernel), n_time)  # kernel can't exceed signal
 
-            first_col = np.r_[hrf_kernel, np.zeros(n_time - n_hrf)]
-            first_row = np.r_[hrf_kernel[0], np.zeros(n_time - 1)]
-            A = scipy.linalg.toeplitz(first_col, first_row)
-            A = np.asarray(A, dtype=float)
+            # Build the convolution (Toeplitz) design matrix as a BANDED SPARSE
+            # matrix instead of a dense n_time x n_time array. A[i, i-k] =
+            # hrf_kernel[k] for 0 <= k < n_hrf (lower-triangular, bandwidth
+            # n_hrf) — identical to the previous
+            # ``scipy.linalg.toeplitz(np.r_[hrf_kernel, zeros], [hrf_kernel[0],
+            # zeros])`` but without materializing the (almost entirely zero)
+            # dense matrix. The dense form was O(n_time^2) memory and an
+            # O(n_time^3) solve, which froze on real-length recordings; the
+            # banded solve gives the SAME regularized result in ~O(n_time *
+            # n_hrf).
+            import scipy.sparse as _sp
 
-            # Solve the inverse problem with regularization
-            lhs = A.T @ A + float(lmbda) * np.eye(A.shape[1])
+            offsets = -np.arange(n_hrf)
+            diag_data = np.repeat(
+                hrf_kernel[:n_hrf].reshape(-1, 1), n_time, axis=1
+            )
+            A = _sp.dia_matrix(
+                (diag_data, offsets), shape=(n_time, n_time)
+            ).tocsr()
+
+            # Tikhonov-regularized normal equations: (AᵀA + λI) x = Aᵀy.
+            # AᵀA + λI is symmetric positive-definite (λ > 0) and banded with
+            # half-bandwidth n_hrf-1. Solve with LAPACK's banded Cholesky
+            # (scipy.linalg.solveh_banded): O(n_time * n_hrf²), linear in the
+            # scan length, vs the old dense O(n_time³) that froze on real
+            # recordings. Same regularized result as the dense solve.
+            AtA = A.T @ A + float(lmbda) * _sp.identity(n_time, format="csr")
             rhs = A.T @ Y
 
+            def _solve():
+                kd = n_hrf - 1
+                ab = np.zeros((kd + 1, n_time))  # LAPACK upper-banded storage
+                for d in range(kd + 1):
+                    ab[kd - d, d:] = AtA.diagonal(d)
+                return scipy.linalg.solveh_banded(ab, rhs)
+
             with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(self.solve_lstsq, lhs, rhs, cond_thresh)
+                future = executor.submit(_solve)
                 try:
-                    deconvolved_signal = future.result(timeout)
+                    deconvolved_signal = np.asarray(future.result(timeout))
                     success = True
                 except TimeoutError:
-                    print(f"lstsq exceeded {timeout}s timeout, dropping channel")
+                    print(f"solve exceeded {timeout}s timeout, dropping channel")
                     deconvolved_signal = nirx
                     success = False
                 except Exception as exc:
-                    # Any other solve failure (numpy LinAlgError, ValueError on
-                    # malformed inputs, etc.) should be treated as a channel
-                    # drop, not propagated out of estimate_activity. Matching
-                    # M4's "no orphans after failure" contract — if we let the
-                    # exception escape, the outer loop's cleanup never runs.
-                    print(f"lstsq failed for channel: {type(exc).__name__}: {exc}; dropping channel")
+                    # Any solve failure (singular system, malformed inputs,
+                    # etc.) drops the channel rather than propagating out of
+                    # estimate_activity. Matching M4's "no orphans after
+                    # failure" contract — if the exception escaped, the outer
+                    # loop's cleanup would never run.
+                    print(f"solve failed for channel: {type(exc).__name__}: {exc}; dropping channel")
                     deconvolved_signal = nirx
                     success = False
 
@@ -545,78 +620,113 @@ class montage(tree):
 
             if 'global' in ch_name: continue # Skip if global hrf estimate
 
-            # Detect degenerate HRF traces that would produce NaN (zero-length,
-            # missing, or all-zeros) so we fall back to canonical instead of
-            # silently dividing by zero in the deconvolution closure (H1).
-            trace_invalid = (
-                hrf.trace is None
-                or len(hrf.trace) == 0
-                or np.max(np.abs(hrf.trace)) == 0
-            )
-            if trace_invalid and hrf_model != 'canonical':
-                print(
-                    f"WARNING: HRF trace for channel {ch_name} is empty or all-zero; "
-                    "falling back to canonical HRF"
-                )
-
-            # If canonical HRF requested (or forced by a degenerate trace)
-            if hrf_model == 'canonical' or trace_invalid:
-                print(f"WARNING: Using canonical HRF for channel {ch_name} in {nirx_obj}")
-                estimate_hrf = hrf # Temporarily replace HRF
-                # S4: fetch a canonical generated at the scan's own sfreq
-                # (and the montage's duration context) rather than the
-                # old hardcoded root.right sentinel which was locked to
-                # 7.81 Hz / 30 s regardless of the calling scan.
-                canonical_duration = float(self.context.get('duration', 30.0))
-                if _is_oxygenated(ch_name):
-                    hrf = self.hbo_tree.get_canonical_hrf(
-                        True, self.sfreq, canonical_duration
-                    )
-                else:
-                    hrf = self.hbr_tree.get_canonical_hrf(
-                        False, self.sfreq, canonical_duration
-                    )
-
-            # Figure out which channel to apply to. Track the match explicitly:
-            # a bare for/break leaves nirx_channel bound to the LAST iterated
-            # channel when ch_name matches nothing, which would silently apply
-            # this HRF's deconvolution to an unrelated channel. self.channels
-            # can legitimately contain a channel absent from this scan — e.g. a
-            # montage loaded via load_montage (configured=True, so configure()
-            # is skipped), or estimate_activity reused across scans with
-            # differing layouts — so a no-match must skip, not act on a stale
-            # loop variable.
+            # matched_channel is bound inside the try below; pre-bind so the
+            # except path can reference it safely if a failure happens early.
             matched_channel = None
-            for nirx_channel in nirx_obj.info['chs']:
-                if ch_name == standardize_name(nirx_channel['ch_name']):
-                    matched_channel = nirx_channel
-                    break
-            if matched_channel is None:
-                print(
-                    f"WARNING: channel {ch_name} not found in scan {nirx_obj}; "
-                    "skipping deconvolution for it"
+
+            # Per-channel resilience: any failure (solve timeout/singularity,
+            # malformed input, apply_function error) drops just this channel
+            # when drop_failed_channels is True, instead of aborting the whole
+            # scan. Set it False for all-or-nothing behaviour.
+            try:
+                # Detect degenerate HRF traces that would produce NaN (zero-length,
+                # missing, or all-zeros) so we fall back to canonical instead of
+                # silently dividing by zero in the deconvolution closure (H1).
+                trace_invalid = (
+                    hrf.trace is None
+                    or len(hrf.trace) == 0
+                    or np.max(np.abs(hrf.trace)) == 0
                 )
-                continue
+                if trace_invalid and hrf_model not in ('canonical', 'library'):
+                    print(
+                        f"WARNING: HRF trace for channel {ch_name} is empty or all-zero; "
+                        "falling back to canonical HRF"
+                    )
 
-            print(f"Deconvolving channel {ch_name}...") # Apply deconvolution
-            nirx_obj.apply_function(deconvolution, picks = [matched_channel['ch_name']]) # Apply deconvolution for channel
+                # If a library HRF was supplied, deconvolve every channel with it.
+                # Orient it by oxygenation (as-given for the source's oxygenation,
+                # sign-flipped for the opposite), mirroring how the canonical path
+                # signs HbO vs HbR. Takes precedence over the canonical fallback.
+                if hrf_model == 'library':
+                    estimate_hrf = hrf  # save original; restored after the channel
+                    oriented = (
+                        library_kernel
+                        if _is_oxygenated(ch_name) == bool(library_oxygenation)
+                        else -library_kernel
+                    )
+                    hrf = SimpleNamespace(trace=oriented)
 
-            # Remove channel if neural activity estimation failed to converge.
-            # M4: also drop the orphaned entry from self.channels and the
-            # hbo/hbr channel lists so downstream iterators (correlate_hrf,
-            # generate_distribution) don't trip on a stale pointer. The
-            # spatial tree copy of the HRF is left in place for now — the
-            # broken tree.delete path is fixed in fix/tree-delete-filter, and
-            # tree orphans are harmless until that lands because nothing in
-            # this release iterates the full tree except montage.branch()
-            # which rebuilds from self.channels.
-            if success is False:
-                nirx_obj.drop_channels([matched_channel['ch_name']])
+                # If canonical HRF requested (or forced by a degenerate trace)
+                elif hrf_model == 'canonical' or trace_invalid:
+                    print(f"WARNING: Using canonical HRF for channel {ch_name} in {nirx_obj}")
+                    estimate_hrf = hrf # Temporarily replace HRF
+                    # S4: fetch a canonical generated at the scan's own sfreq
+                    # (and the montage's duration context) rather than the
+                    # old hardcoded root.right sentinel which was locked to
+                    # 7.81 Hz / 30 s regardless of the calling scan.
+                    canonical_duration = float(self.context.get('duration', 30.0))
+                    if _is_oxygenated(ch_name):
+                        hrf = self.hbo_tree.get_canonical_hrf(
+                            True, self.sfreq, canonical_duration
+                        )
+                    else:
+                        hrf = self.hbr_tree.get_canonical_hrf(
+                            False, self.sfreq, canonical_duration
+                        )
+
+                # Figure out which channel to apply to. Track the match
+                # explicitly: a bare for/break leaves the loop variable bound
+                # to the LAST iterated channel when ch_name matches nothing,
+                # which would silently apply this HRF's deconvolution to an
+                # unrelated channel. self.channels can legitimately contain a
+                # channel absent from this scan (a montage loaded via
+                # load_montage, or estimate_activity reused across scans with
+                # differing layouts) — so a no-match must skip, not act on a
+                # stale loop variable.
+                for nirx_channel in nirx_obj.info['chs']:
+                    if ch_name == standardize_name(nirx_channel['ch_name']):
+                        matched_channel = nirx_channel
+                        break
+                if matched_channel is None:
+                    print(
+                        f"WARNING: channel {ch_name} not found in scan {nirx_obj}; "
+                        "skipping deconvolution for it"
+                    )
+                    continue
+
+                print(f"Deconvolving channel {ch_name}...") # Apply deconvolution
+                nirx_obj.apply_function(deconvolution, picks = [matched_channel['ch_name']]) # Apply deconvolution for channel
+
+                # Remove channel if neural activity estimation failed to converge.
+                # M4: also drop the orphaned entry from self.channels and the
+                # hbo/hbr channel lists so downstream iterators (correlate_hrf,
+                # generate_distribution) don't trip on a stale pointer. The
+                # spatial tree copy of the HRF is left in place for now — the
+                # broken tree.delete path is fixed in fix/tree-delete-filter, and
+                # tree orphans are harmless until that lands because nothing in
+                # this release iterates the full tree except montage.branch()
+                # which rebuilds from self.channels.
+                if success is False:
+                    nirx_obj.drop_channels([matched_channel['ch_name']])
+                    dropped_channels.append(ch_name)
+
+                # Replace the canonical / library HRF temporarily used with the
+                # original per-channel HRF (so self.channels is never disturbed).
+                if hrf_model in ('canonical', 'library'):
+                    hrf = estimate_hrf # Replace the original HRF
+            except Exception as exc:  # noqa: BLE001 — per-channel drop guard
+                if not drop_failed_channels:
+                    raise
+                print(
+                    f"WARNING: dropping channel {ch_name} after a deconvolution "
+                    f"error: {type(exc).__name__}: {exc}"
+                )
+                if (
+                    matched_channel is not None
+                    and matched_channel['ch_name'] in nirx_obj.ch_names
+                ):
+                    nirx_obj.drop_channels([matched_channel['ch_name']])
                 dropped_channels.append(ch_name)
-
-            # Replace the canonical HRF estimate temporarily used with the HRF estimate
-            if hrf_model == 'canonical':
-                hrf = estimate_hrf # Replace the original HRF
 
         for ch_name in dropped_channels:
             self.channels.pop(ch_name, None)
