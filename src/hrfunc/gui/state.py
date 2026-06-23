@@ -251,6 +251,11 @@ class AppState:
     selected_scan: Optional[ScanEntry] = None
     raw_cache: RawCache = field(default_factory=RawCache)
     processed_cache: RawCache = field(default_factory=RawCache)
+    # LRU(3) of *deconvolved* (neural-activity) Raw objects, keyed per scan.
+    # ``activity_raw`` only holds the single most-recent result; this cache
+    # keeps each scan's deconvolution so channel-wise 3-stage QC (raw vs
+    # hemoglobin vs activity) can read a scan's activity without re-running.
+    activity_cache: RawCache = field(default_factory=RawCache)
     preload_path: Optional[Path] = None
     busy: bool = False
     estimation_progress: Optional[Tuple[int, int, str]] = None
@@ -281,6 +286,12 @@ class AppState:
     # scan B's Raw would silently produce wrong results because the library
     # matches by channel name, not by scan identity.
     montage_source_scan: Optional[ScanEntry] = None
+    # Per-scan estimated montages, keyed by ``ScanEntry.path.resolve()``.
+    # ``montage`` only holds the single most-recent estimate; this cache keeps
+    # each scan's HRFs so toeplitz activity can deconvolve every scan with its
+    # OWN HRFs (single + bulk) instead of erroring "HRFs belong to another
+    # scan". Only real per-channel Montages are stored (never _CanonicalResult).
+    montage_cache: Dict[Path, Any] = field(default_factory=dict)
     # Deconvolved Raw from the most recent estimate_activity call (Sprint 3.4).
     # Typed Any for the same import-graph reason. The Activity panel reads
     # the data + annotations for the lens-style preproc/deconv overlay plot.
@@ -322,6 +333,40 @@ class AppState:
     # full-detail view. None = no channel focused yet (grid renders, no
     # detail view).
     hrf_selected_channel: Optional[str] = None
+    # User-uploaded events for HRF estimation (HRFs tab). Many scans reach
+    # the GUI without usable MNE annotations, so the event picker would be
+    # empty; an uploaded events file supplies onsets instead. ``events_rows``
+    # is a list of ``events_io.EventRow`` (typed Any to keep events_io out of
+    # the state import graph). When set, it OVERRIDES a scan's embedded
+    # annotations for the scans it applies to: the scan recorded in
+    # ``events_source_scan`` always, plus every scan when ``events_apply_all``
+    # is True (paradigms shared across scans). ``events_format`` is
+    # "bids"/"simple" for the source badge; ``events_source_label`` is the
+    # filename. All cleared on reset / project switch.
+    events_rows: Optional[List[Any]] = None
+    # Per-sample 0/1 impulse/design vector (events_io "impulse" format),
+    # mutually exclusive with events_rows. Applied by sample index.
+    events_impulse: Optional[List[int]] = None
+    events_format: Optional[str] = None
+    events_source_label: Optional[str] = None
+    events_apply_all: bool = False
+    events_source_scan: Optional[ScanEntry] = None
+    # True when the current events were auto-matched from a collocated file
+    # (drives the "auto-matched" badge vs an explicit upload).
+    events_is_automatched: bool = False
+    # Resolved scan paths the auto-matcher should leave alone: scans the user
+    # manually set/cleared, or scans where discovery already ran and found
+    # nothing. Prevents re-clobbering a manual choice and avoids re-scanning
+    # the folder every render. Cleared on reset / project switch.
+    events_no_automatch: Set[Path] = field(default_factory=set)
+    # Resolved scan paths whose ``processed_cache`` entry was produced with
+    # the DECONVOLUTION preprocessing pipeline (deconvolution=True). HRF and
+    # neural-activity estimation require deconvolution-preprocessed data, so
+    # the HRFs / Activity tabs gate on membership here; a GLM/hemoglobin
+    # preprocess (deconvolution=False) is intentionally NOT added, which
+    # blocks estimation until the scan is re-preprocessed in deconvolution
+    # mode. Updated wherever a processed Raw is cached; cleared on reset.
+    processed_deconvolved: Set[Path] = field(default_factory=set)
     # Toggles for the MNI fsaverage overlay surfaces on the /library
     # plotly viz. The "brain" toggle controls the pial cortical
     # surface (where the neural activity originates); the "scalp"
@@ -333,6 +378,12 @@ class AppState:
     # cortex-relative position is the scientifically meaningful one.
     library_show_brain: bool = True
     library_show_scalp: bool = True
+    # Toggle for the per-HRF metadata hover popups on the /library viz. When
+    # False the scatter markers use hoverinfo="none" -- the tooltip is hidden
+    # but hover/click events still fire, so ROI clicks and shift-hover paint
+    # keep working. Defaults ON (the popups are the main way to read an HRF's
+    # context); users dealing with dense clouds can switch them off.
+    library_show_info: bool = True
     # Oxygenation filter for the /library viz. ``"both"`` (default)
     # shows HbO + HbR; ``"hbo"`` / ``"hbr"`` hide the other channel.
     # Researchers often want to inspect one haemoglobin at a time;
@@ -771,6 +822,8 @@ class AppState:
         self.selected_scan = None
         self.raw_cache.clear()
         self.processed_cache.clear()
+        self.activity_cache.clear()
+        self.montage_cache.clear()
         self.preload_path = None
         self.busy = False
         self.estimation_progress = None
@@ -785,6 +838,15 @@ class AppState:
         self.montage = None
         self.montage_source_scan = None
         self.activity_raw = None
+        self.events_rows = None
+        self.events_impulse = None
+        self.events_format = None
+        self.events_source_label = None
+        self.events_apply_all = False
+        self.events_source_scan = None
+        self.events_is_automatched = False
+        self.events_no_automatch.clear()
+        self.processed_deconvolved.clear()
         self.activity_source_scan = None
         self.quality_metrics.clear()
         # Note: library_hbo / library_hbr are deliberately NOT cleared by
@@ -796,6 +858,7 @@ class AppState:
         # context overlays when they re-enter the library page.
         self.library_show_brain = True
         self.library_show_scalp = True
+        self.library_show_info = True
         self.library_oxygenation = "both"
         # Per-ROI cluster state lives in ``cluster_rois``. Layout
         # refactor (2026-05-16) made the empty list the default; adding

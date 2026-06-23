@@ -26,7 +26,69 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Awaitable, Callable, List, Optional, Sequence, Tuple
+from contextlib import nullcontext
+from typing import Any, Awaitable, Callable, List, Optional, Sequence, Tuple, Union
+
+
+def capture_client():
+    """Return the current NiceGUI client, or None if there's no slot context.
+
+    Call this synchronously inside an event handler / render slot (where a
+    client context exists). The returned client can then be re-entered from a
+    detached ``background_tasks.create`` coroutine via :func:`client_scope`,
+    so UI calls there (``ui.notify``, refreshable ``.refresh()``) have a slot
+    — without it they raise "The current slot cannot be determined ... slot
+    stack is empty".
+    """
+    try:
+        from nicegui import context
+        return context.client
+    except Exception:  # noqa: BLE001 — no slot / headless / tests
+        return None
+
+
+def client_scope(client):
+    """Context manager that re-enters ``client`` (from :func:`capture_client`),
+    or a no-op when it's None. Use inside a background task:
+    ``with client_scope(client): ui.notify(...)``."""
+    return client if client is not None else nullcontext()
+
+
+def client_alive(client) -> bool:
+    """True if a captured client still exists (not deleted / disconnected).
+
+    A long background task can outlive its page client — the user navigates
+    away, reloads, or the native window's client reconnects mid-run. Touching
+    a deleted client (``ui.notify``, ``.refresh()``) trips NiceGUI's "Client
+    has been deleted but is still being used" warning. Guard UI emissions from
+    detached tasks with this so a finished bulk run doesn't warn/raise when
+    its page is gone.
+    """
+    if client is None:
+        return False
+    try:
+        from nicegui import Client
+        return client.id in Client.instances
+    except Exception:  # noqa: BLE001 — nicegui internals / headless / tests
+        return False
+
+
+def notify_if_alive(client, message: str, **kwargs) -> None:
+    """``ui.notify(message, **kwargs)`` only if ``client`` is still alive.
+
+    Re-enters the client's slot context to emit; silently skips (logging at
+    debug) when the page client has been deleted, so a completed background
+    task can report its result without crashing on a stale client.
+    """
+    if not client_alive(client):
+        logger.debug("notify_if_alive: client gone; skipping toast: %s", message)
+        return
+    try:
+        from nicegui import ui
+        with client:
+            ui.notify(message, **kwargs)
+    except Exception as exc:  # noqa: BLE001 — client died between check & emit
+        logger.debug("notify_if_alive: notify failed: %s", exc)
 
 from .state import AppState
 from ..io.manifest import ScanEntry
@@ -121,10 +183,49 @@ async def run_in_background(
 BulkResult = Tuple[List[ScanEntry], List[Tuple[ScanEntry, str]]]
 
 
+def summarize_failures(
+    failures: Sequence[Tuple[ScanEntry, str]], limit: int = 4
+) -> str:
+    """Render a bulk run's failures into a human-readable, reason-first string.
+
+    Bulk summary toasts used to list only scan *names* ("Failed: a, b, c"),
+    which told the user nothing about *why*. This groups failures by their
+    reason so the toast says e.g.::
+
+        2 scans: deconvolution preprocessing produced no output …;
+        1 scan: toeplitz needs estimated HRFs in memory …
+
+    Identical reasons are collapsed with a count; distinct reasons are listed
+    (up to ``limit``) so a mixed batch still shows each failure mode. An
+    example scan name is appended to each reason group so the user can find
+    the offending file.
+    """
+    if not failures:
+        return ""
+    # Preserve first-seen order of reasons while grouping scans under each.
+    grouped: "dict[str, List[ScanEntry]]" = {}
+    for scan, reason in failures:
+        grouped.setdefault(reason or "unknown error", []).append(scan)
+
+    parts: List[str] = []
+    for reason, scans in list(grouped.items())[:limit]:
+        example = scans[0].display_name or scans[0].path.name
+        if len(scans) == 1:
+            parts.append(f"{example}: {reason}")
+        else:
+            parts.append(f"{len(scans)} scans ({example}, …): {reason}")
+    if len(grouped) > limit:
+        parts.append(f"(+{len(grouped) - limit} more failure type(s))")
+    return " | ".join(parts)
+
+
 async def run_bulk_in_background(
     state: AppState,
     scans: Sequence[ScanEntry],
-    build_call: Callable[[ScanEntry], Optional[Tuple[Callable[..., Any], tuple, dict]]],
+    build_call: Callable[
+        [ScanEntry],
+        Union[None, str, Tuple[Callable[..., Any], tuple, dict]],
+    ],
     *,
     on_each_done: Optional[Callable[[ScanEntry, Any], Awaitable[None]]] = None,
     label: str = "bulk run",
@@ -139,9 +240,15 @@ async def run_bulk_in_background(
 
     The per-scan call is built by ``build_call(scan) -> (func, args, kwargs)``
     so each panel can layer its own preflight (e.g. "is the raw cached
-    for this scan?") without duplicating the dispatch machinery. Returning
-    ``None`` from ``build_call`` skips the scan with a "not ready"
-    reason -- counted as skipped, not failed.
+    for this scan?") without duplicating the dispatch machinery.
+
+    A ``build_call`` may decline a scan in two ways, both recorded in the
+    failures bucket so the summary toast can explain why:
+
+    - return ``None`` -- a generic, reasonless skip (legacy behaviour);
+    - return a ``str`` -- an intentional skip carrying that exact reason
+      (e.g. "toeplitz needs estimated HRFs in memory"). Prefer this so the
+      user sees *why* a scan was passed over, not just that it was.
 
     Continue-on-error semantics: per-scan exceptions are caught, logged,
     stamped onto ``state.last_error`` (overwritten per failure), and the
@@ -191,7 +298,13 @@ async def run_bulk_in_background(
                 continue
 
             if built is None:
-                failures.append((scan, "skipped (preflight)"))
+                failures.append(
+                    (scan, "skipped — not eligible for this run (preflight)")
+                )
+                continue
+            if isinstance(built, str):
+                # Intentional skip carrying its own reason.
+                failures.append((scan, built))
                 continue
 
             func, args, kwargs = built

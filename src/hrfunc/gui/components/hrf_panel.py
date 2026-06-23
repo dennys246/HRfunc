@@ -12,6 +12,15 @@ Sprint 3.3 ships:
 - Controls: model radio (toeplitz/canonical), event picker (multi-select
   toggles), lambda slider on log scale (1e-5..1e-1, default 1e-3),
   duration field (default 30.0 s).
+
+Events can come from the scan's own MNE annotations OR an uploaded file
+(``events_io``: BIDS ``events.tsv`` or a simple ``onset,label`` CSV). An
+uploaded file overrides annotations for the scan it was loaded against, and
+for every scan when "apply to all checked scans" is set (shared paradigms).
+Onsets are converted to a per-scan impulse series, so one table fits scans
+of differing length. A wildcard box mass-selects labels by glob, and the
+Estimate button runs a coverage pre-flight that warns when a scan is too
+short to contain the events.
 - Result preview: matplotlib base64 PNG showing all estimated HRF traces
   overlaid by channel (toeplitz mode) or the canonical HRF (canonical mode).
 
@@ -51,12 +60,196 @@ import numpy as np
 from nicegui import background_tasks, ui
 
 from ..state import AppState
+from ..events_io import (
+    EventsParseError,
+    build_impulse_from_rows,
+    build_impulse_from_vector,
+    coverage_report,
+    coverage_report_vector,
+    discover_collocated_events,
+    find_event_files,
+    parse_events_file,
+)
 from ..workers import (
+    capture_client,
+    client_scope,
     make_progress_callback,
+    notify_if_alive,
     run_bulk_in_background,
     run_in_background,
+    summarize_failures,
 )
 from ...io.manifest import ScanEntry
+
+# Library default edge-expansion fraction in montage.estimate_hrf. Used to
+# estimate the dropped start-of-scan window for the coverage warning so it
+# matches what the core actually discards.
+_EDGE_EXPANSION = 0.15
+
+
+def _file_applies_to_scan(state: AppState, scan: Optional[ScanEntry]) -> bool:
+    """True when an uploaded events file should drive ``scan``'s estimation.
+
+    The file overrides embedded annotations for the scan it was uploaded
+    against (``events_source_scan``) always, and for every scan when
+    ``events_apply_all`` is set (shared paradigm across the batch).
+    """
+    if (state.events_rows is None and state.events_impulse is None) or scan is None:
+        return False
+    if state.events_apply_all:
+        return True
+    src = state.events_source_scan
+    return src is not None and src.path == scan.path
+
+
+def _event_labels_for_scan(
+    state: AppState, scan: Optional[ScanEntry], raw
+) -> List[str]:
+    """Available event labels for a scan — file labels when the file applies,
+    else the scan's own annotation descriptions. An impulse vector has the
+    single synthetic label "events"."""
+    if _file_applies_to_scan(state, scan):
+        if state.events_impulse is not None:
+            return ["events"]
+        return sorted({row.label for row in state.events_rows})
+    return sorted_unique_annotation_descriptions(raw)
+
+
+def _resolve_bulk_events(state: AppState, scan: ScanEntry, raw, snapshot):
+    """Resolve the events a *bulk* HRF run should use for one scan.
+
+    A bulk run can't lean on the single global events slot (it only holds one
+    scan's worth) or on the UI's single label selection — the single-scan path
+    fills those by auto-matching on selection, but checking a batch never
+    triggers that. So resolve each scan independently, mirroring the
+    single-scan precedence:
+
+      1. the manually-loaded file when it applies (apply-to-all paradigm, or
+         this is the upload's source scan) — keep the user's label selection;
+      2. else a collocated sidecar discovered for THIS scan (BIDS-strict then
+         lone-file) — use all of its conditions;
+      3. else the scan's own embedded annotations — use every description.
+
+    Returns ``(event_rows, event_impulse, selected_events)``. When all three
+    sources are empty the tuple is ``(None, None, ())`` so the caller can fail
+    the scan with a clear "no events found" reason instead of silently
+    estimating on an all-zero impulse.
+    """
+    if _file_applies_to_scan(state, scan):
+        return state.events_rows, state.events_impulse, snapshot.selected_events
+
+    all_paths = [s.path for s in state.manifest.scans] if state.manifest else []
+    found = discover_collocated_events(scan.path, all_paths)
+    if found is not None:
+        try:
+            parsed = parse_events_file(found)
+        except EventsParseError:
+            parsed = None
+        if parsed is not None:
+            if parsed.impulse is not None:
+                return None, list(parsed.impulse), ("events",)
+            return parsed.rows, None, tuple(parsed.labels())
+
+    # Fall back to this scan's own annotations (all descriptions).
+    return None, None, tuple(sorted_unique_annotation_descriptions(raw))
+
+
+def _maybe_automatch_events(
+    state: AppState, scan: Optional[ScanEntry], opts: EstimationOptions
+) -> None:
+    """Auto-match a collocated events file to ``scan`` on selection.
+
+    Fires when no loaded events cover this scan and the user hasn't opted it
+    out (manual upload / clear, or a prior empty discovery). BIDS-strict then
+    lone-file (see ``discover_collocated_events``). Loads silently with an
+    "auto-matched" badge the user can clear or override. A successful match is
+    NOT added to ``events_no_automatch`` so returning to the scan re-matches
+    it even after the single global slot was replaced by another scan.
+    """
+    if scan is None or _file_applies_to_scan(state, scan):
+        return
+    key = scan.path.resolve()
+    if key in state.events_no_automatch:
+        return
+    all_paths = [s.path for s in state.manifest.scans] if state.manifest else []
+    found = discover_collocated_events(scan.path, all_paths)
+    if found is None:
+        state.events_no_automatch.add(key)  # nothing here; don't re-scan
+        return
+    try:
+        parsed = parse_events_file(found)
+    except EventsParseError:
+        state.events_no_automatch.add(key)  # broken file; don't retry
+        return
+    _apply_parsed_events(state, opts, scan, parsed, is_auto=True)
+    state.events_apply_all = False
+    # Verbose: announce the auto-match (this fires once per scan — the match
+    # is memoized — so it isn't spammy). The not-found case is conveyed by
+    # the status banner ("scan annotations · none loaded from file").
+    ui.notify(
+        f"Auto-matched events: {found.name} ({_events_summary(parsed)}).",
+        type="positive",
+    )
+
+
+def _events_summary(parsed) -> str:
+    """One-line description of a parsed events file (format + counts)."""
+    if parsed.impulse is not None:
+        return f"impulse vector, {int(sum(parsed.impulse))} events"
+    return (
+        f"{parsed.fmt}, {len(parsed.rows)} onsets, "
+        f"{len(parsed.labels())} condition(s)"
+    )
+
+
+def _apply_parsed_events(
+    state: AppState,
+    opts: EstimationOptions,
+    scan: Optional[ScanEntry],
+    parsed,
+    *,
+    is_auto: bool,
+) -> None:
+    """Load an ``EventsParse`` into state (handles onset rows vs impulse vector).
+
+    Sets the source fields and seeds the selection. Caller owns
+    ``events_apply_all`` and ``events_no_automatch`` policy.
+    """
+    if parsed.impulse is not None:
+        state.events_impulse = list(parsed.impulse)
+        state.events_rows = None
+    else:
+        state.events_rows = parsed.rows
+        state.events_impulse = None
+    state.events_format = parsed.fmt
+    state.events_source_label = parsed.source_name
+    state.events_source_scan = scan
+    state.events_is_automatched = is_auto
+    opts.selected_events = tuple(parsed.labels())
+
+
+def _event_counts_for_scan(state: AppState, scan, raw) -> dict:
+    """Map each event label to its occurrence count, for the picker display.
+
+    Counts come from the uploaded file when it applies to ``scan``, else
+    from the scan's annotations. Surfacing counts makes a non-descriptive
+    marker (e.g. a numeric SNIRF trigger labelled "1.0") read as an event
+    with N occurrences rather than a mystery checkbox.
+    """
+    from collections import Counter
+
+    if _file_applies_to_scan(state, scan):
+        if state.events_impulse is not None:
+            return {"events": int(sum(state.events_impulse))}
+        return dict(Counter(row.label for row in state.events_rows))
+    counts: dict = {}
+    annotations = getattr(raw, "annotations", None)
+    if annotations is not None:
+        for ann in annotations:
+            description = str(ann["description"])
+            if description:
+                counts[description] = counts.get(description, 0) + 1
+    return counts
 
 if TYPE_CHECKING:
     import mne
@@ -70,6 +263,8 @@ DEFAULT_DURATION = 30.0
 DEFAULT_LMBDA = 1e-3
 LOG_LMBDA_MIN = -5
 LOG_LMBDA_MAX = -1
+# Per-channel solve timeout (s); mirrors montage.estimate_hrf's default.
+DEFAULT_TIMEOUT = 30.0
 
 
 @dataclass
@@ -84,6 +279,9 @@ class EstimationOptions:
     lmbda: float = DEFAULT_LMBDA
     duration: float = DEFAULT_DURATION
     selected_events: Tuple[str, ...] = field(default_factory=tuple)
+    # Per-channel lstsq solve timeout (seconds), forwarded to
+    # montage.estimate_hrf. A channel that exceeds it is skipped.
+    timeout: float = DEFAULT_TIMEOUT
 
 
 def render(state: AppState) -> None:
@@ -112,6 +310,13 @@ def render(state: AppState) -> None:
     # HRFs-tab body re-render, avoiding the 6-subscriber re-render
     # cascade that republishing hrf_estimated would cause.
     state.subscribe("hrf_selection_changed", _refresh)
+    # React to busy transitions so the inline "Preprocess now" / estimate
+    # spinner appears immediately on start and clears on finish (the poll
+    # timer below only fires while estimation_progress is set).
+    state.subscribe("busy_changed", _refresh)
+    # Recompute bulk mode when the dataset-tree checked set changes, so
+    # ticking scans immediately makes them eligible to estimate.
+    state.subscribe("checked_changed", _refresh)
 
     # Progress polling timer — refreshes the body every 0.5 s WHILE an
     # estimation is in flight, so the progress bar advances. The
@@ -160,64 +365,137 @@ def _render_body(state: AppState, opts: EstimationOptions) -> None:
             ).classes("text-sm opacity-60")
             return
 
-        if bulk_mode:
-            ui.label(
-                f"Bulk run on {len(checked_scans)} checked scan"
-                f"{'s' if len(checked_scans) != 1 else ''}."
-            ).classes("text-sm font-mono opacity-70")
-        elif scan is not None:
-            ui.label(scan.display_name or scan.path.name).classes(
-                "text-sm font-mono opacity-70"
-            )
-
-        # ── Model selector + controls. The controls remain anchored on
-        # ``selected_scan`` so the user still picks events / lambda /
-        # duration from a concrete scan's metadata -- the bulk run uses
-        # those same options across every checked scan (events that
-        # don't exist in a particular scan are silently dropped by the
-        # per-scan toeplitz call, counting as a "no events" skip).
-        with ui.card().classes("w-full"):
-            ui.label("Estimation").classes(
-                "text-xs uppercase opacity-60 tracking-wide"
-            )
-            _render_model_radio(opts, _refresh_body_for(state))
-            if opts.model == MODEL_TOEPLITZ:
-                if scan is not None:
-                    _render_toeplitz_controls(state, opts, scan)
-                else:
+        # Two-column workspace: estimation controls on the left, the
+        # per-channel HRF visualization in its own column on the right
+        # (mirrors the HRtree tab's viz | detail split so the channel
+        # accordion gets horizontal room instead of stacking under the
+        # controls).
+        with ui.row().classes("w-full gap-6 items-start no-wrap"):
+            with ui.column().classes("flex-1 min-w-0 gap-4"):
+                if bulk_mode:
                     ui.label(
-                        "Pick one of the checked scans to populate the "
-                        "event picker / lambda / duration controls."
-                    ).classes("text-sm opacity-60")
-            else:
-                _render_canonical_note()
+                        f"Bulk run on {len(checked_scans)} checked scan"
+                        f"{'s' if len(checked_scans) != 1 else ''}."
+                    ).classes("text-sm font-mono opacity-70")
+                    if opts.model == MODEL_TOEPLITZ:
+                        ui.label(
+                            "Each scan auto-discovers its own events at run "
+                            "time: an applied uploaded file → a collocated "
+                            "sidecar (BIDS or lone file) → the scan's embedded "
+                            "annotations. Scans with no events of any kind are "
+                            "reported as failures with the reason."
+                        ).classes("text-xs opacity-60 italic")
+                elif scan is not None:
+                    ui.label(scan.display_name or scan.path.name).classes(
+                        "text-sm font-mono opacity-70"
+                    )
 
-        # ── Run button + progress / error display
-        _render_run_row(state, scan, checked_scans, opts)
+                # ── Model selector + controls. The controls remain anchored
+                # on ``selected_scan`` for lambda / duration / (single-scan)
+                # event picking. In bulk the events are NOT taken from the UI
+                # scan's selection -- each checked scan resolves its own
+                # events via ``_resolve_bulk_events`` (uploaded-file →
+                # collocated sidecar → annotations), so a batch of scans with
+                # per-scan sidecars all estimate correctly instead of
+                # inheriting one scan's labels.
+                with ui.card().classes("w-full"):
+                    ui.label("Estimation").classes(
+                        "text-xs uppercase opacity-60 tracking-wide"
+                    )
+                    _render_model_radio(opts, _refresh_body_for(state))
+                    if opts.model == MODEL_TOEPLITZ:
+                        if scan is not None:
+                            _render_toeplitz_controls(state, opts, scan)
+                        else:
+                            ui.label(
+                                "Pick one of the checked scans to populate the "
+                                "event picker / lambda / duration controls."
+                            ).classes("text-sm opacity-60")
+                    else:
+                        _render_canonical_note()
 
-        # ── Result preview (single-scan only; bulk mode overwrites
-        # state.montage scan-by-scan and the preview would just flash
-        # whichever scan landed last)
-        if state.montage is not None and not bulk_mode:
-            ui.separator()
-            ui.label("HRF preview").classes(
-                "text-xs uppercase opacity-60 tracking-wide"
-            )
-            _render_hrf_preview(state, scan, opts)
+                # ── Run button + progress / error display
+                _render_run_row(state, scan, checked_scans, opts)
 
-            # Submission card -- same form the Export tab renders.
-            # Surfaced here so users who finish an estimation can go
-            # straight to sharing without hopping to Export. The
-            # file picker defaults to state.last_saved_roi_path (set
-            # by the Cluster sub-tab's Save montage flow); if the
-            # user hasn't saved yet, they pick the JSON manually.
-            ui.separator()
-            with ui.card().classes("w-full"):
-                from ..submission import render_submission_panel
-                render_submission_panel(
-                    state,
-                    default_path=state.last_saved_roi_path,
-                )
+            # ── Right column: per-channel HRF visualization + save / submit
+            with ui.column().classes("flex-1 min-w-0 gap-3"):
+                _render_preview_column(state, scan, opts, bulk_mode)
+
+
+def _render_preview_column(
+    state: AppState,
+    scan: Optional[ScanEntry],
+    opts: EstimationOptions,
+    bulk_mode: bool,
+) -> None:
+    """Right-hand column: the per-channel HRF visualization + save/submit.
+
+    Kept in its own column (mirroring the HRtree detail pane) so the channel
+    accordion has horizontal room and the estimation controls on the left stay
+    compact. Shows a placeholder until a montage exists.
+
+    Bulk mode overwrites ``state.montage`` scan-by-scan, so during a run the
+    preview would just flash whichever scan landed last -- we gate on
+    ``not state.busy`` so it only appears once the batch FINISHES, and point
+    the preview/save at the scan that actually produced the montage
+    (``montage_source_scan``) rather than the UI selection.
+    """
+    ui.label("HRF preview").classes(
+        "text-xs uppercase opacity-60 tracking-wide"
+    )
+
+    if state.busy:
+        ui.label("Estimating…").classes("text-sm opacity-60")
+        return
+
+    preview_scan = scan if not bulk_mode else state.montage_source_scan
+    if state.montage is None or preview_scan is None:
+        ui.label(
+            "Estimate HRFs to see the per-channel results here."
+        ).classes("text-sm opacity-60")
+        return
+
+    if bulk_mode:
+        shown = preview_scan.display_name or preview_scan.path.name
+        ui.label(
+            f"Showing HRFs for the last-estimated scan: {shown}. "
+            "A bulk run keeps only the most recent scan's HRFs in memory — "
+            "save each scan's HRFs (below or via mass-save), or select a "
+            "single scan to view or re-estimate it."
+        ).classes("text-xs opacity-70 italic")
+
+    _render_hrf_preview(state, preview_scan, opts)
+
+    # Save the estimated HRFs to JSON right here (same action as the Export
+    # tab's "Save montage HRFs"). Only meaningful for a real toeplitz montage.
+    if not isinstance(state.montage, _CanonicalResult):
+        async def _on_save_hrfs(_scan=preview_scan) -> None:
+            from .export_panel import _save_montage
+            await _save_montage(state, _scan)
+
+        with ui.row().classes("items-center gap-2"):
+            ui.button(
+                "Save",
+                icon="save",
+                on_click=_on_save_hrfs,
+            ).props("color=primary")
+            ui.label(
+                "Saves the per-channel estimated HRFs as a tree.load_hrfs "
+                "JSON file."
+            ).classes("text-xs opacity-60")
+
+    # Submission card -- same form the Export tab renders. Surfaced here so
+    # users who finish an estimation can go straight to sharing without
+    # hopping to Export. The file picker defaults to state.last_saved_roi_path
+    # (set by the Cluster sub-tab's Save montage flow); if the user hasn't
+    # saved yet, they pick the JSON manually.
+    ui.separator()
+    with ui.card().classes("w-full"):
+        from ..submission import render_submission_panel
+        render_submission_panel(
+            state,
+            default_path=state.last_saved_roi_path,
+        )
 
 
 def _refresh_body_for(state: AppState):
@@ -246,32 +524,551 @@ def _render_model_radio(
     ).props("inline")
 
 
+def _preprocess_now(state: AppState, scan: ScanEntry) -> None:
+    """Run the DECONVOLUTION preprocessing pipeline on ``scan`` from the HRFs
+    tab.
+
+    Reuses the Preprocess tab's ``run_pipeline_sync`` so the output is
+    byte-identical to running it there (one source of truth for the
+    pipeline). HRF estimation requires deconvolution-mode preprocessing, so
+    this forces ``deconvolution=True`` and records it in
+    ``processed_deconvolved``. On completion the result lands in
+    ``processed_cache`` and ``preprocess_done`` fires, refreshing the panel.
+    """
+    if state.busy:
+        return
+    if scan not in state.raw_cache:
+        state.last_error = "Raw not loaded yet; wait for the scan to load."
+        return
+    # Lazy import: keep the module-load import graph free of a cross-panel
+    # dependency, and guarantee the same pipeline as the Preprocess tab.
+    from .preprocess_panel import PreprocessOptions, run_pipeline_sync
+
+    snapshot = PreprocessOptions(deconvolution=True)  # required for HRF est.
+    raw = state.raw_cache.get(scan)
+
+    async def _on_done(result) -> None:
+        if result is None:
+            return
+        state.processed_cache._cache[scan.path.resolve()] = result
+        # Honor the LRU bound (RawCache.put() centralizes this once PR #68
+        # lands; evict inline here as the other cache writers do today).
+        while len(state.processed_cache._cache) > state.processed_cache.maxsize:
+            state.processed_cache._cache.popitem(last=False)
+        state.processed_deconvolved.add(scan.path.resolve())
+        state.publish("preprocess_done", scan)
+
+    ui.notify("Preprocessing…", type="info")
+    background_tasks.create(
+        run_in_background(
+            state, run_pipeline_sync, raw, snapshot, on_done=_on_done
+        )
+    )
+
+
+def _render_preprocess_now(state: AppState, scan: ScanEntry) -> None:
+    """Render the 'not preprocessed yet -> Preprocess now' affordance."""
+    if state.busy:
+        with ui.row().classes("items-center gap-2"):
+            ui.spinner(size="sm")
+            ui.label("Preprocessing…").classes("text-sm opacity-70")
+        return
+    ui.label(
+        "This scan isn't preprocessed yet — HRF estimation runs on the "
+        "preprocessed signal."
+    ).classes("text-sm opacity-70")
+    loaded = scan in state.raw_cache
+    with ui.row().classes("items-center gap-2"):
+        ui.button(
+            "Preprocess now",
+            icon="play_arrow",
+            on_click=lambda: _preprocess_now(state, scan),
+        ).props(f"color=primary {'disable' if not loaded else ''}")
+        ui.label(
+            "Uses default settings — for custom options use the Preprocess tab."
+        ).classes("text-xs opacity-60")
+    if not loaded:
+        ui.label(
+            "Waiting for the scan to finish loading…"
+        ).classes("text-xs opacity-60")
+
+
+def _render_needs_deconvolution(state: AppState, scan: ScanEntry) -> None:
+    """Shown when a scan is preprocessed in GLM/haemoglobin mode: HRF
+    estimation requires the deconvolution pipeline, so block + offer a
+    one-click re-preprocess in deconvolution mode."""
+    if state.busy:
+        with ui.row().classes("items-center gap-2"):
+            ui.spinner(size="sm")
+            ui.label("Preprocessing…").classes("text-sm opacity-70")
+        return
+    ui.label(
+        "This scan was preprocessed for haemoglobin (GLM mode), but HRF "
+        "estimation requires the deconvolution pipeline."
+    ).classes("text-sm text-amber-400")
+    ui.button(
+        "Re-preprocess with deconvolution",
+        icon="play_arrow",
+        on_click=lambda: _preprocess_now(state, scan),
+    ).props("color=primary")
+
+
+def _set_events_selection(
+    state: AppState, opts: EstimationOptions, selection: Tuple[str, ...]
+) -> None:
+    """Set the selected-events tuple and refresh the picker."""
+    opts.selected_events = selection
+    state.publish("hrf_selection_changed")
+
+
+def _set_apply_all(state: AppState, value: bool) -> None:
+    state.events_apply_all = value
+    state.publish("hrf_selection_changed")
+
+
+def _clear_events_file(state: AppState, opts: EstimationOptions) -> None:
+    """Drop the loaded events file and revert to scan annotations.
+
+    The scan the file belonged to is added to ``events_no_automatch`` so the
+    auto-matcher doesn't immediately re-load it on the next render — clearing
+    is an explicit "use annotations for this scan" choice.
+    """
+    if state.events_source_scan is not None:
+        state.events_no_automatch.add(state.events_source_scan.path.resolve())
+    state.events_rows = None
+    state.events_impulse = None
+    state.events_format = None
+    state.events_source_label = None
+    state.events_apply_all = False
+    state.events_source_scan = None
+    state.events_is_automatched = False
+    opts.selected_events = ()  # re-seeds from annotations on next render
+    state.publish("hrf_selection_changed")
+
+
+def _render_events_source(
+    state: AppState, opts: EstimationOptions, scan: ScanEntry
+) -> None:
+    """Compact events-source row: a loud status of what's loaded + a single
+    "Upload / find events…" button that opens the find-window dialog where
+    all the loading options live."""
+    loaded = state.events_rows is not None or state.events_impulse is not None
+
+    if loaded:
+        _render_events_status(state, scan)
+    else:
+        ui.label(
+            "Events source: this scan's own annotations (none loaded from "
+            "file)."
+        ).classes("text-xs opacity-60")
+
+    async def _open() -> None:
+        # Surface any failure as a toast — a silent exception here is exactly
+        # the "button does nothing" symptom.
+        try:
+            await _open_events_dialog(state, opts, scan)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("events dialog failed to open: %s", exc)
+            ui.notify(
+                f"Couldn't open events dialog: {type(exc).__name__}: {exc}",
+                type="negative",
+            )
+
+    with ui.row().classes("items-center gap-2"):
+        ui.button(
+            "Upload / find events…", icon="upload_file", on_click=_open
+        ).props("flat dense")
+        if loaded:
+            ui.checkbox(
+                "Apply to all checked scans",
+                value=state.events_apply_all,
+                on_change=lambda e: _set_apply_all(state, bool(e.value)),
+            ).props("dense").classes("text-xs")
+            ui.button(
+                "Use annotations instead",
+                on_click=lambda: _clear_events_file(state, opts),
+            ).props("flat dense")
+
+
+async def _open_events_dialog(
+    state: AppState, opts: EstimationOptions, scan: Optional[ScanEntry]
+) -> None:
+    """Find-window dialog for loading events.
+
+    A glob box searches the loaded project folder for event files and
+    highlights matches; selecting one shows a format/count preview so a
+    wrong file is obvious before loading. "Browse…" falls back to the OS
+    picker. On Load the file is parsed and applied (with the apply-to-all
+    choice). All file-loading options live here so the HRFs page stays tidy.
+    """
+    root = state.manifest.root if state.manifest is not None else None
+    sel = {
+        "pattern": "",
+        "results": find_event_files(root, "") if root else [],
+        "chosen": None,
+        "parsed": None,
+        "error": None,
+        "apply_all": state.events_apply_all,
+    }
+
+    def _choose(path: Path) -> None:
+        sel["chosen"] = path
+        try:
+            sel["parsed"] = parse_events_file(path)
+            sel["error"] = None
+        except EventsParseError as exc:
+            sel["parsed"] = None
+            sel["error"] = str(exc)
+        _results.refresh()
+        _preview.refresh()
+
+    def _search() -> None:
+        sel["results"] = find_event_files(root, sel["pattern"]) if root else []
+        _results.refresh()
+
+    with ui.dialog() as dialog, ui.card().classes("w-[640px] max-w-full gap-2"):
+        ui.label("Load events").classes("text-lg font-semibold")
+        ui.label(
+            f"Searching project: {root}" if root else
+            "No project loaded — use Browse to pick a file."
+        ).classes("text-xs opacity-60 break-all")
+
+        with ui.row().classes("w-full items-center gap-2"):
+            ui.input(
+                placeholder="filter, e.g. events*  or  *.tsv  (blank = all)",
+                on_change=lambda e: sel.__setitem__("pattern", e.value or ""),
+            ).props("dense outlined").classes("flex-1").on(
+                "keydown.enter", lambda e: _search()
+            )
+            ui.button("Search", icon="search", on_click=_search).props("flat dense")
+
+            async def _browse() -> None:
+                from .dataset_picker import pick_file
+                path = await pick_file(
+                    file_types=["Events (*.tsv;*.csv;*.txt)", "All files (*.*)"],
+                )
+                if path is not None:
+                    _choose(path)
+
+            ui.button("Browse…", icon="folder_open", on_click=_browse).props(
+                "flat dense"
+            )
+
+        @ui.refreshable
+        def _results() -> None:
+            if not sel["results"]:
+                ui.label(
+                    "No matching files. Adjust the filter and Search, or Browse."
+                ).classes("text-sm opacity-60")
+                return
+            with ui.column().classes("w-full max-h-60 overflow-auto gap-0"):
+                for path in sel["results"]:
+                    rel = (
+                        str(path.relative_to(root)) if root
+                        and root in path.parents else path.name
+                    )
+                    is_chosen = sel["chosen"] == path
+                    row = ui.row().classes(
+                        "w-full items-center gap-2 px-2 py-1 rounded cursor-pointer "
+                        + ("bg-indigo-700/40" if is_chosen else "hover:bg-slate-700/40")
+                    )
+                    with row:
+                        ui.icon("description").classes("text-indigo-300 text-sm")
+                        ui.label(rel).classes("text-xs font-mono")
+                    row.on("click", lambda _e=None, p=path: _choose(p))
+
+        _results()
+
+        @ui.refreshable
+        def _preview() -> None:
+            if sel["error"]:
+                ui.label(f"⚠ Can't read: {sel['error']}").classes(
+                    "text-xs text-red-400"
+                )
+                return
+            parsed = sel["parsed"]
+            if parsed is None:
+                return
+            if parsed.impulse is not None:
+                ui.label(
+                    f"✓ {sel['chosen'].name}: IMPULSE vector · "
+                    f"{len(parsed.impulse)} samples · "
+                    f"{int(sum(parsed.impulse))} events."
+                ).classes("text-xs text-green-400")
+            else:
+                ui.label(
+                    f"✓ {sel['chosen'].name}: {parsed.fmt.upper()} · "
+                    f"{len(parsed.rows)} onsets · "
+                    f"{len(parsed.labels())} condition(s)."
+                ).classes("text-xs text-green-400")
+                if parsed.needs_simple_confirm:
+                    ui.label(
+                        "Note: simple onset,label shape (not BIDS events.tsv)."
+                    ).classes("text-xs opacity-60")
+
+        _preview()
+
+        ui.checkbox(
+            "Apply to all checked scans",
+            value=sel["apply_all"],
+            on_change=lambda e: sel.__setitem__("apply_all", bool(e.value)),
+        ).props("dense").classes("text-xs")
+
+        with ui.row().classes("justify-end gap-2 w-full"):
+            ui.button("Cancel", on_click=lambda: dialog.submit(None)).props("flat")
+            ui.button(
+                "Load",
+                on_click=lambda: dialog.submit(
+                    sel["chosen"] if sel["parsed"] is not None else None
+                ),
+            ).props("color=primary")
+
+    dialog.open()
+    chosen = await dialog
+    if chosen is None:
+        return
+    try:
+        parsed = parse_events_file(chosen)
+    except EventsParseError as exc:
+        ui.notify(f"Couldn't read events: {exc}", type="negative")
+        return
+    _apply_parsed_events(state, opts, scan, parsed, is_auto=False)
+    state.events_apply_all = bool(sel["apply_all"])
+    if scan is not None:
+        state.events_no_automatch.add(scan.path.resolve())
+    for warning in parsed.warnings:
+        ui.notify(warning, type="warning")
+    ui.notify(
+        f"Loaded events from {chosen.name} ({_events_summary(parsed)}).",
+        type="positive",
+    )
+    state.publish("hrf_selection_changed")
+
+
+def _render_events_status(state: AppState, scan: Optional[ScanEntry]) -> None:
+    """LOUD banner describing the loaded events: file, format, how it loaded,
+    counts, and (for impulse vectors) whether the length matches this scan."""
+    fmt = (state.events_format or "").upper()
+    how = "auto-matched" if state.events_is_automatched else "uploaded"
+    with ui.column().classes(
+        "w-full gap-0.5 px-3 py-2 rounded-md "
+        "bg-indigo-950/40 border border-indigo-700/60"
+    ):
+        with ui.row().classes("items-center gap-2"):
+            ui.icon(
+                "auto_awesome" if state.events_is_automatched else "description"
+            ).classes("text-indigo-300")
+            ui.label(
+                f"Events {how}: {state.events_source_label or '(file)'}"
+            ).classes("text-sm font-medium")
+            ui.badge(fmt or "?").props("color=indigo")
+
+        # Format-specific provenance line.
+        if state.events_impulse is not None:
+            n_samp = len(state.events_impulse)
+            n_ev = int(sum(state.events_impulse))
+            ui.label(
+                f"Per-sample impulse vector · {n_samp} samples · {n_ev} event "
+                "onset(s) · applied by sample index."
+            ).classes("text-xs opacity-80")
+            # Length-match check against the current scan — the key "is this
+            # the right vector for this scan?" signal.
+            raw = (
+                state.processed_cache.get(scan)
+                if scan is not None and scan in state.processed_cache
+                else (
+                    state.raw_cache.get(scan)
+                    if scan is not None and scan in state.raw_cache
+                    else None
+                )
+            )
+            if raw is not None:
+                scan_n = int(raw.n_times)
+                if scan_n == n_samp:
+                    ui.label(
+                        f"✓ Length matches this scan ({scan_n} samples)."
+                    ).classes("text-xs text-green-400")
+                elif n_samp > scan_n:
+                    ui.label(
+                        f"⚠ Vector ({n_samp}) is LONGER than this scan "
+                        f"({scan_n}) — trailing {n_samp - scan_n} samples will "
+                        "be dropped."
+                    ).classes("text-xs text-amber-400")
+                else:
+                    ui.label(
+                        f"⚠ Vector ({n_samp}) is SHORTER than this scan "
+                        f"({scan_n}) — the tail has no events."
+                    ).classes("text-xs text-amber-400")
+        else:
+            rows = state.events_rows or []
+            labels = sorted({r.label for r in rows})
+            shown = ", ".join(labels[:6]) + ("…" if len(labels) > 6 else "")
+            ui.label(
+                f"Onset events · {len(rows)} onset(s) · {len(labels)} "
+                f"condition(s): {shown}"
+            ).classes("text-xs opacity-80")
+
+        scope = (
+            "ALL checked scans" if state.events_apply_all else "this scan only"
+        )
+        ui.label(f"Applies to: {scope}").classes("text-xs opacity-60")
+
+
+async def _confirm_simple_events(parsed) -> bool:
+    """Warn that a file matched only the simple onset,label shape; confirm use."""
+    with ui.dialog() as dialog, ui.card():
+        ui.label("Simple events file").classes("text-base font-semibold")
+        ui.label(
+            f"'{parsed.source_name}' looks like a simple onset,label file, "
+            "not a BIDS events.tsv (no trial_type / duration columns). "
+            f"Continue using it? Detected {len(parsed.rows)} events across "
+            f"{len(parsed.labels())} label(s)."
+        ).classes("text-sm opacity-80")
+        with ui.row().classes("justify-end gap-2 w-full"):
+            ui.button("Cancel", on_click=lambda: dialog.submit(False)).props("flat")
+            ui.button(
+                "Use it", on_click=lambda: dialog.submit(True)
+            ).props("color=primary")
+    dialog.open()
+    return bool(await dialog)
+
+
+async def _confirm_coverage(issues) -> bool:
+    """Confirm dialog listing scans whose events fall outside the usable window."""
+    with ui.dialog() as dialog, ui.card().classes("max-w-xl"):
+        ui.label("Some events fall outside the scan").classes(
+            "text-base font-semibold"
+        )
+        ui.label(
+            "These scans are shorter than the events extend, or have events "
+            "inside the dropped edge-expansion window. Out-of-range events "
+            "won't contribute to the estimate. Proceed anyway?"
+        ).classes("text-sm opacity-80")
+        for scan, cov in issues:
+            name = scan.display_name or scan.path.name
+            parts = []
+            if cov.past_end:
+                parts.append(f"{cov.past_end} past end")
+            if cov.in_edge:
+                parts.append(f"{cov.in_edge} in edge window")
+            ui.label(
+                f"• {name}: {cov.scan_seconds:.0f}s scan, events to "
+                f"{cov.max_onset_s:.0f}s — {', '.join(parts)}; "
+                f"{cov.placed} usable."
+            ).classes("text-xs font-mono opacity-80")
+        with ui.row().classes("justify-end gap-2 w-full"):
+            ui.button("Cancel", on_click=lambda: dialog.submit(False)).props("flat")
+            ui.button(
+                "Estimate anyway", on_click=lambda: dialog.submit(True)
+            ).props("color=primary")
+    dialog.open()
+    return bool(await dialog)
+
+
+async def _estimate_clicked(
+    state: AppState,
+    selected: Optional[ScanEntry],
+    checked: List[ScanEntry],
+    opts: EstimationOptions,
+) -> None:
+    """Estimate-button handler: coverage pre-flight, then dispatch.
+
+    For toeplitz scans driven by an uploaded events file, check that the
+    scan is long enough to contain the events (and flag the dropped edge
+    window). If any scan drops events, confirm before running. Annotation-
+    sourced scans keep the library's lenient drop behavior.
+    """
+    issues = []
+    if opts.model == MODEL_TOEPLITZ:
+        scans = list(checked) if checked else (
+            [selected] if selected is not None else []
+        )
+        for scan in scans:
+            if not _file_applies_to_scan(state, scan):
+                continue
+            if scan not in state.processed_cache:
+                continue
+            raw = state.processed_cache.get(scan)
+            sfreq = float(raw.info["sfreq"])
+            n_samples = int(raw.n_times)
+            edge_samples = int(round(_EDGE_EXPANSION * opts.duration * sfreq))
+            if state.events_impulse is not None:
+                cov = coverage_report_vector(
+                    state.events_impulse, sfreq, n_samples, edge_samples,
+                )
+            else:
+                cov = coverage_report(
+                    state.events_rows, opts.selected_events,
+                    sfreq, n_samples, edge_samples,
+                )
+            if cov.past_end or cov.in_edge:
+                issues.append((scan, cov))
+    if issues and not await _confirm_coverage(issues):
+        return
+    _run_dispatch(state, selected, checked, opts)
+
+
 def _render_toeplitz_controls(
     state: AppState, opts: EstimationOptions, scan: ScanEntry
 ) -> None:
     """Event picker + lmbda slider + duration field for toeplitz mode."""
+    # Try to auto-match a collocated events file for this scan before we read
+    # the event source (no-op if one already applies or the user opted out).
+    _maybe_automatch_events(state, scan, opts)
     raw = state.processed_cache.get(scan) if scan in state.processed_cache else None
 
     # ── Event picker
     ui.label("Events").classes("text-xs uppercase opacity-60 tracking-wide")
     if raw is None:
-        ui.label(
-            "Preprocess the scan first (Preprocess tab) before estimating."
-        ).classes("text-sm opacity-60")
+        # Not preprocessed yet -- offer a one-click "Preprocess now" right
+        # here instead of sending the user to the Preprocess tab.
+        _render_preprocess_now(state, scan)
         return
 
-    event_names = sorted_unique_annotation_descriptions(raw)
+    if scan.path.resolve() not in state.processed_deconvolved:
+        # Preprocessed, but with the GLM/haemoglobin pipeline — HRF
+        # estimation requires deconvolution-mode preprocessing. Hard-block
+        # and offer a one-click re-preprocess.
+        _render_needs_deconvolution(state, scan)
+        return
+
+    # Source row: upload an events file (overrides annotations) or use the
+    # scan's own annotations.
+    _render_events_source(state, opts, scan)
+
+    event_names = _event_labels_for_scan(state, scan, raw)
     if not event_names:
         ui.label(
-            "No events found in the preprocessed scan."
+            "No events in this scan. Upload an events file above to supply "
+            "trial onsets, then pick which to estimate."
         ).classes("text-sm opacity-60")
     else:
-        # Seed selection on first render — default to all events so users
-        # don't need to tick anything in the common case.
-        if not opts.selected_events:
+        # Seed (or re-seed) the selection to all labels when it's empty or
+        # entirely stale (e.g. after switching scans or swapping the event
+        # source). A deliberate subset that still overlaps is left alone.
+        if not (set(opts.selected_events) & set(event_names)):
             opts.selected_events = tuple(event_names)
 
+        # Condition selection: which event labels to estimate. (File finding
+        # / globbing lives in the Upload dialog now — this is just picking
+        # conditions among the loaded events.)
+        ui.label("Conditions to estimate").classes(
+            "text-xs uppercase opacity-50 tracking-wide"
+        )
+        with ui.row().classes("items-center gap-2"):
+            ui.button(
+                "All",
+                on_click=lambda: _set_events_selection(
+                    state, opts, tuple(sorted(event_names))
+                ),
+            ).props("flat dense")
+            ui.button(
+                "None",
+                on_click=lambda: _set_events_selection(state, opts, ()),
+            ).props("flat dense")
+
         selected_set = set(opts.selected_events)
+        counts = _event_counts_for_scan(state, scan, raw)
 
         def _toggle(name: str, checked: bool) -> None:
             new_selection = set(opts.selected_events)
@@ -283,8 +1080,12 @@ def _render_toeplitz_controls(
 
         with ui.row().classes("gap-2 flex-wrap"):
             for name in event_names:
+                count = counts.get(name, 0)
+                # Show the occurrence count so a bare numeric marker reads as
+                # an event ("1.0 (42)"), not a mystery checkbox. Selection
+                # still keys off the raw label, not the displayed text.
                 ui.checkbox(
-                    name,
+                    f"{name}  ({count})" if count else name,
                     value=name in selected_set,
                     on_change=(lambda e, n=name: _toggle(n, bool(e.value))),
                 )
@@ -324,6 +1125,28 @@ def _render_toeplitz_controls(
         step=1.0,
         format="%.1f",
         on_change=lambda e: setattr(opts, "duration", float(e.value or DEFAULT_DURATION)),
+    )
+
+    # ── Per-channel solve timeout (forwarded to estimate_hrf). A channel
+    # whose solve exceeds this is skipped, not the whole scan.
+    ui.label("Per-channel timeout (seconds)").classes(
+        "text-xs uppercase opacity-60 tracking-wide"
+    )
+
+    def _on_timeout(event) -> None:
+        try:
+            opts.timeout = max(1.0, float(event.value))
+        except (TypeError, ValueError):
+            opts.timeout = DEFAULT_TIMEOUT
+
+    ui.number(
+        value=opts.timeout,
+        min=1.0,
+        step=5.0,
+        format="%.0f",
+        on_change=_on_timeout,
+    ).tooltip(
+        "Seconds to wait for one channel's solve before skipping it."
     )
 
     # ── Edge-expansion advisory (library default 0.15 of duration)
@@ -377,6 +1200,7 @@ def _render_run_row(
         can_run = (
             scan is not None
             and scan in state.processed_cache
+            and scan.path.resolve() in state.processed_deconvolved
             and bool(opts.selected_events)
             and not state.busy
         )
@@ -386,9 +1210,14 @@ def _render_run_row(
         run_label = "Generate canonical HRF"
 
     with ui.row().classes("items-center gap-3"):
+        # Async handler (passed directly, NOT wrapped in a sync lambda, which
+        # would silently no-op) so the coverage pre-flight dialog can await.
+        async def _on_estimate() -> None:
+            await _estimate_clicked(state, scan, checked, opts)
+
         ui.button(
             run_label,
-            on_click=lambda: _run_dispatch(state, scan, checked, opts),
+            on_click=_on_estimate,
         ).props(f"color=primary {'disable' if not can_run else ''}")
         if state.busy:
             _render_busy_progress(state)
@@ -509,16 +1338,49 @@ def _run_bulk(
         lmbda=opts.lmbda,
         duration=opts.duration,
         selected_events=opts.selected_events,
+        timeout=opts.timeout,
     )
 
     def _build(scan: ScanEntry):
         if snapshot.model == MODEL_TOEPLITZ:
-            if scan not in state.processed_cache:
-                # Preflight skip -- record as failure via the worker.
-                return None
-            raw = state.processed_cache.get(scan)
             progress_cb = make_progress_callback(state)
-            return (run_toeplitz_sync, (raw, snapshot, progress_cb), {})
+
+            def _pp_and_estimate(scan=scan, progress_cb=progress_cb):
+                # Preprocess on demand (deconvolution) if this scan isn't
+                # already cached+deconvolved, so the bulk run triggers the
+                # preprocessing each scan needs instead of skipping it.
+                # ensure_deconvolved_raw raises with a specific reason on
+                # failure; let it propagate so the worker records why.
+                from .preprocess_panel import ensure_deconvolved_raw
+                raw = ensure_deconvolved_raw(state, scan)
+                # Discover this scan's own events (manual file → collocated
+                # sidecar → embedded annotations). The single global events
+                # slot only covers one scan, so a batch must resolve each
+                # scan independently or every other scan estimates on empty
+                # events ("no usable event-locked responses").
+                event_rows, event_impulse, selected = _resolve_bulk_events(
+                    state, scan, raw, snapshot
+                )
+                if event_rows is None and event_impulse is None and not selected:
+                    raise RuntimeError(
+                        "no events found for this scan — no events file "
+                        "collocated with it (BIDS sidecar or lone file) and "
+                        "the scan has no embedded annotations; load/glob an "
+                        "events file, or check that sidecars sit beside the "
+                        "scan"
+                    )
+                scan_opts = EstimationOptions(
+                    model=snapshot.model,
+                    lmbda=snapshot.lmbda,
+                    duration=snapshot.duration,
+                    selected_events=selected,
+                    timeout=snapshot.timeout,
+                )
+                return run_toeplitz_sync(
+                    raw, scan_opts, progress_cb, event_rows, event_impulse
+                )
+
+            return (_pp_and_estimate, (), {})
         # Canonical: prefer processed_cache, fall back to raw_cache,
         # otherwise load on demand inside the worker thread.
         def _run_canonical():
@@ -533,17 +1395,30 @@ def _run_bulk(
 
     async def _on_each_done(scan: ScanEntry, result) -> None:
         if result is None:
-            return
+            # Raise so an empty estimate is reported as a failure (with a
+            # reason) instead of silently counting as a success.
+            raise RuntimeError(
+                "HRF estimation produced no result — no channels had usable "
+                "event-locked responses (check events coverage and channels)"
+            )
         state.montage = result
         state.montage_source_scan = scan
+        # Cache per scan so toeplitz activity can use each scan's own HRFs
+        # (montage only holds the most-recent estimate). Canonical results
+        # aren't real per-channel montages, so they're never cached.
+        if not isinstance(result, _CanonicalResult):
+            state.montage_cache[scan.path.resolve()] = result
         state.publish("hrf_estimated", scan)
 
     async def _bulk() -> None:
-        bulk_result = await run_bulk_in_background(
-            state, scans, _build,
-            on_each_done=_on_each_done,
-            label="estimate_hrf",
-        )
+        # Re-enter the captured client so refreshes work from this detached
+        # task (no slot context otherwise).
+        with client_scope(client):
+            bulk_result = await run_bulk_in_background(
+                state, scans, _build,
+                on_each_done=_on_each_done,
+                label="estimate_hrf",
+            )
         if bulk_result is None:
             return
         successes, failures = bulk_result
@@ -555,16 +1430,16 @@ def _run_bulk(
         )
         summary = f"{verb} {n_ok}/{n_ok + n_fail} scan(s)."
         if failures:
-            fail_names = ", ".join(
-                s.display_name or s.path.name for s, _ in failures[:3]
-            )
-            if len(failures) > 3:
-                fail_names += f" (+{len(failures) - 3} more)"
-            summary += f" Failed/skipped: {fail_names}."
-        ui.notify(
-            summary, type="positive" if n_fail == 0 else "warning"
+            summary += f" Failed/skipped: {summarize_failures(failures)}"
+        # Guarded: the page client may have been deleted during a long run.
+        notify_if_alive(
+            client, summary,
+            type="positive" if n_fail == 0 else "warning",
+            multi_line=True,
+            close_button=True,
         )
 
+    client = capture_client()
     background_tasks.create(_bulk())
 
 
@@ -585,19 +1460,30 @@ def _run(
         lmbda=opts.lmbda,
         duration=opts.duration,
         selected_events=opts.selected_events,
+        timeout=opts.timeout,
     )
 
     if snapshot.model == MODEL_TOEPLITZ:
         if scan not in state.processed_cache:
             state.last_error = "Preprocess the scan first."
             return
+        if scan.path.resolve() not in state.processed_deconvolved:
+            state.last_error = (
+                "HRF estimation requires deconvolution-mode preprocessing — "
+                "re-preprocess this scan with deconvolution."
+            )
+            return
         if not snapshot.selected_events:
             state.last_error = "Pick at least one event."
             return
         raw = state.processed_cache.get(scan)
         progress_cb = make_progress_callback(state)
+        applies = _file_applies_to_scan(state, scan)
+        event_rows = state.events_rows if applies else None
+        event_impulse = state.events_impulse if applies else None
         sync_call = (
-            run_toeplitz_sync, raw, snapshot, progress_cb
+            run_toeplitz_sync, raw, snapshot, progress_cb, event_rows,
+            event_impulse,
         )
     else:
         # Canonical mode doesn't need a processed Raw — only the raw_cache
@@ -621,6 +1507,9 @@ def _run(
         # Track which scan produced this montage so the Activity tab can
         # refuse a toeplitz run when the user switches scans mid-flow.
         state.montage_source_scan = scan
+        # Cache per scan so toeplitz activity can use each scan's own HRFs.
+        if not isinstance(result, _CanonicalResult):
+            state.montage_cache[scan.path.resolve()] = result
         state.publish("hrf_estimated", scan)
 
     background_tasks.create(
@@ -632,18 +1521,31 @@ def run_toeplitz_sync(
     raw: "mne.io.BaseRaw",
     opts: EstimationOptions,
     progress_callback=None,
+    event_rows=None,
+    event_impulse=None,
 ):
     """Run montage.estimate_hrf against a preprocessed Raw and return Montage.
 
-    Returns None if the events array can't be built (no annotation samples
-    match the selection). The library's ``estimate_hrf`` is called with
-    ``preprocess=False`` because the input is already preprocessed.
-
-    Module-level so tests can call without dispatching through workers.
+    Events come from, in priority order: an uploaded per-sample impulse
+    vector (``event_impulse``, applied by sample index), an uploaded onset
+    table (``event_rows`` — ``events_io.EventRow`` list, converted to a 0/1
+    impulse at this scan's sfreq), else the Raw's MNE annotations. Returns
+    None if no event samples land inside the scan (nothing to estimate).
+    ``estimate_hrf`` runs with ``preprocess=False`` (input already
+    preprocessed). Module-level so tests can call it directly.
     """
     from ...hrfunc import montage as Montage
 
-    events = build_events_array(raw, opts.selected_events)
+    n_samples = int(raw.n_times)
+    if event_impulse is not None:
+        events = build_impulse_from_vector(event_impulse, n_samples)
+    elif event_rows is not None:
+        sfreq = float(raw.info["sfreq"])
+        events = build_impulse_from_rows(
+            event_rows, opts.selected_events, sfreq, n_samples
+        )
+    else:
+        events = build_events_array(raw, opts.selected_events)
     if events is None or not events.any():
         logger.warning(
             "run_toeplitz_sync: no event samples matched the selected "
@@ -659,6 +1561,7 @@ def run_toeplitz_sync(
         lmbda=opts.lmbda,
         preprocess=False,
         progress_callback=progress_callback,
+        timeout=opts.timeout,
     )
     # estimate_hrf only appends to optode.estimates; it does NOT populate
     # optode.trace (which is what the preview reads). generate_distribution
@@ -826,54 +1729,56 @@ def _render_hrf_preview(
 
 
 def _render_toeplitz_gallery(state: AppState, montage) -> None:
-    """Per-channel HRF gallery: clickable mini-plots + detail panel.
+    """Per-channel HRF results as an accordion of dropdowns.
 
-    The mini-plots are rendered as base64 PNGs so they're inert (no plotly
-    state); clicks are wired through a ``ui.element`` wrapper around each
-    image that calls a closure setting ``state.hrf_selected_channel``. A
-    second ``@ui.refreshable`` block below the grid renders the full-size
-    plot for the currently-selected channel (with ±1 std shading).
+    One expandable row per channel (the channel name as the header); the
+    FIRST channel is open by default so the user immediately sees an
+    estimated HRF. Each channel's plot (trace + ±1 std shading) renders
+    lazily the first time its dropdown is opened, so a large montage doesn't
+    pay for every plot up front.
     """
     channels = _gather_channel_traces(montage)
     if not channels:
         ui.label("No channel HRFs available.").classes("text-sm opacity-60")
         return
 
-    if (
-        state.hrf_selected_channel is None
-        or state.hrf_selected_channel not in channels
-    ):
-        # Default-focus on the first channel so users see a detail view
-        # immediately rather than a blank "click one" prompt.
-        state.hrf_selected_channel = next(iter(channels))
+    ui.label(
+        f"{len(channels)} channel HRF{'s' if len(channels) != 1 else ''} — "
+        "open a channel to view its estimated response."
+    ).classes("text-xs opacity-60")
 
-    # ── Grid of mini-plots
-    with ui.row().classes("flex-wrap gap-2 max-w-4xl"):
-        for ch_name in channels.keys():
-            png = _render_mini_hrf_png(channels[ch_name])
-            selected = ch_name == state.hrf_selected_channel
-            border = "border-primary border-2" if selected else "border border-slate-700"
-            with ui.element("div").classes(
-                f"cursor-pointer rounded p-1 {border}"
-            ).on(
-                "click", lambda c=ch_name: _on_channel_click(state, c)
-            ):
-                if png is not None:
-                    ui.image(png).classes("w-32 h-20")
-                ui.label(ch_name).classes(
-                    "text-xs font-mono opacity-80 text-center w-32"
-                )
+    with ui.column().classes("w-full gap-1 max-w-2xl"):
+        for index, (ch_name, node) in enumerate(channels.items()):
+            _render_channel_dropdown(node, ch_name, open_default=(index == 0))
 
-    # ── Detail panel for the selected channel
-    selected = state.hrf_selected_channel
-    if selected and selected in channels:
-        ui.separator()
-        ui.label(f"Channel detail — {selected}").classes(
-            "text-xs uppercase opacity-60 tracking-wide"
-        )
-        png = _render_detail_hrf_png(channels[selected], selected)
-        if png is not None:
-            ui.image(png).classes("max-w-2xl")
+
+def _render_channel_dropdown(node, ch_name: str, open_default: bool) -> None:
+    """One channel's collapsible HRF panel; plot rendered lazily on open."""
+    expansion = ui.expansion(ch_name, value=open_default).classes(
+        "w-full border border-slate-700 rounded"
+    ).props("dense")
+    with expansion:
+        container = ui.column().classes("w-full p-2")
+
+    done = {"rendered": False}
+
+    def _fill() -> None:
+        if done["rendered"]:
+            return
+        done["rendered"] = True
+        with container:
+            png = _render_detail_hrf_png(node, ch_name)
+            if png is not None:
+                ui.image(png).classes("w-full max-w-2xl")
+            else:
+                ui.label(
+                    "Plot unavailable for this channel."
+                ).classes("text-xs opacity-60")
+
+    if open_default:
+        _fill()
+    # Render on first expand; collapsing doesn't tear it down (cheap to keep).
+    expansion.on_value_change(lambda e: _fill() if e.value else None)
 
 
 def _on_channel_click(state: AppState, ch_name: str) -> None:

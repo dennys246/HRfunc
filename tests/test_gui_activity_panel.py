@@ -58,6 +58,8 @@ class TestActivityOptions:
         assert opts.hrf_model == activity_panel.MODEL_TOEPLITZ
         assert opts.lmbda == 1e-4  # library default
         assert opts.preview_channel == 0
+        assert opts.timeout == 30.0  # estimate_activity default
+        assert opts.drop_failed_channels is True
 
     def test_is_dataclass(self):
         import dataclasses
@@ -180,6 +182,78 @@ class TestRunActivitySync:
         assert constructed == []
         assert called_estimate == [existing]
 
+    def test_library_mode_passes_trace_and_builds_fresh_montage(self, monkeypatch):
+        """Library mode ignores existing_montage, builds a fresh one, and
+        forwards the supplied trace + oxygenation to estimate_activity."""
+        from hrfunc import hrfunc as hrf_module
+
+        raw = _make_fake_raw()
+        constructed = []
+        captured = {}
+
+        class _FakeMontage:
+            def __init__(self, nirx_obj=None):
+                constructed.append(nirx_obj)
+                self.channels = {}
+
+            def estimate_activity(self, nirx_obj, **kwargs):
+                captured.update(kwargs)
+                return nirx_obj
+
+        monkeypatch.setattr(hrf_module, "montage", _FakeMontage)
+
+        opts = activity_panel.ActivityOptions(
+            hrf_model=activity_panel.MODEL_LIBRARY,
+            library_trace=[0.0, 0.5, 1.0, 0.5, 0.0],
+            library_oxygenation=False,
+        )
+        activity_panel.run_activity_sync(raw, opts, existing_montage=object())
+
+        assert len(constructed) == 1  # fresh montage despite existing_montage
+        assert captured["hrf_model"] == activity_panel.MODEL_LIBRARY
+        assert captured["library_trace"] == [0.0, 0.5, 1.0, 0.5, 0.0]
+        assert captured["library_oxygenation"] is False
+
+
+class TestLibraryKernelHelpers:
+    """Pure helpers backing the HRtree (library) deconvolution source."""
+
+    def test_kernel_none_when_no_selection(self):
+        st = AppState()
+        st.library_selected_hrf = None
+        assert activity_panel._library_kernel_from_state(st) is None
+
+    def test_kernel_none_when_trace_empty(self):
+        st = AppState()
+        st.library_selected_hrf = {"hrf_mean": [], "oxygenation": True}
+        assert activity_panel._library_kernel_from_state(st) is None
+
+    def test_kernel_reads_trace_and_oxygenation(self):
+        st = AppState()
+        st.library_selected_hrf = {"hrf_mean": [1.0, 2.0], "oxygenation": True}
+        trace, oxy = activity_panel._library_kernel_from_state(st)
+        assert trace == [1.0, 2.0]
+        assert oxy is True
+
+    def test_snapshot_captures_library_kernel(self):
+        st = AppState()
+        st.library_selected_hrf = {"hrf_mean": [0.1, 0.2], "oxygenation": False}
+        opts = activity_panel.ActivityOptions(
+            hrf_model=activity_panel.MODEL_LIBRARY
+        )
+        snap = activity_panel._snapshot_options(st, opts)
+        assert snap.library_trace == [0.1, 0.2]
+        assert snap.library_oxygenation is False
+
+    def test_snapshot_no_kernel_for_canonical(self):
+        st = AppState()
+        st.library_selected_hrf = {"hrf_mean": [0.1], "oxygenation": True}
+        opts = activity_panel.ActivityOptions(
+            hrf_model=activity_panel.MODEL_CANONICAL
+        )
+        snap = activity_panel._snapshot_options(st, opts)
+        assert snap.library_trace is None
+
     def test_forwards_preprocess_false(self, monkeypatch):
         from hrfunc import hrfunc as hrf_module
 
@@ -204,6 +278,32 @@ class TestRunActivitySync:
         assert kwargs_seen[0]["preprocess"] is False
         assert kwargs_seen[0]["lmbda"] == 5e-5
         assert kwargs_seen[0]["hrf_model"] == "canonical"
+
+    def test_forwards_timeout_and_drop_failed_channels(self, monkeypatch):
+        from hrfunc import hrfunc as hrf_module
+
+        raw = _make_fake_raw()
+        kwargs_seen = []
+
+        class _FakeMontage:
+            def __init__(self, nirx_obj=None):
+                self.channels = {}
+
+            def estimate_activity(self, nirx_obj, **kwargs):
+                kwargs_seen.append(kwargs)
+                return nirx_obj
+
+        monkeypatch.setattr(hrf_module, "montage", _FakeMontage)
+
+        opts = activity_panel.ActivityOptions(
+            hrf_model=activity_panel.MODEL_CANONICAL,
+            timeout=12.0,
+            drop_failed_channels=False,
+        )
+        activity_panel.run_activity_sync(raw, opts)
+
+        assert kwargs_seen[0]["timeout"] == 12.0
+        assert kwargs_seen[0]["drop_failed_channels"] is False
 
 
 class TestMontageStateProtection:
@@ -306,9 +406,10 @@ class TestStateMontageSourceScan:
 async def test_panel_toeplitz_rejects_cross_scan_montage(
     user: User, tmp_path
 ):
-    """Toeplitz mode must refuse when state.montage came from a different
-    scan than the one currently selected — applying scan A's HRFs to scan
-    B's Raw would silently produce wrong results."""
+    """Toeplitz mode must refuse when only ANOTHER scan's HRFs exist —
+    applying scan A's HRFs to scan B's Raw would silently produce wrong
+    results. With per-scan montage caching, selecting scan B (whose HRFs
+    aren't cached) reports it has no estimated HRFs of its own."""
     scan_a = ScanEntry(
         format="snirf", path=tmp_path / "a.snirf", display_name="scan_a"
     )
@@ -320,12 +421,12 @@ async def test_panel_toeplitz_rejects_cross_scan_montage(
     global_state.manifest = Manifest(root=tmp_path, scans=(scan_a, scan_b))
     global_state.selected_scan = scan_b
     global_state.processed_cache._cache[scan_b.path.resolve()] = raw
-    # Stash a non-CanonicalResult, non-None montage tagged to scan A
+    # A real montage tagged to scan A only (not in scan B's cache).
     global_state.montage = object()  # Stand-in for a real Montage
     global_state.montage_source_scan = scan_a
 
     await user.open("/")
-    await user.should_see("estimated from scan_a")
+    await user.should_see("No estimated HRFs for this scan")
 
 
 # ---------------------------------------------------------------------------
@@ -371,9 +472,11 @@ async def test_panel_toeplitz_needs_hrfs_first(user: User, tmp_path):
     global_state.manifest = Manifest(root=tmp_path, scans=(scan,))
     global_state.selected_scan = scan
     global_state.processed_cache._cache[scan.path.resolve()] = raw
-    # No montage set → toeplitz mode should prompt for HRFs first
+    # No montage set → toeplitz mode should prompt for HRFs first, and offer
+    # a jump to the HRFs tab so the user can accomplish it.
     await user.open("/")
     await user.should_see("Toeplitz mode requires estimated HRFs")
+    await user.should_see("Go to HRFs tab")
 
 
 async def test_panel_toeplitz_rejects_canonical_result_montage(
@@ -427,3 +530,41 @@ async def test_workspace_subscribes_activity_panel(user: User, tmp_path):
     assert "hrf_estimated" in global_state.subscribers
     # hrf_estimated has both HRFs tab + Activity tab subscribers
     assert len(global_state.subscribers["hrf_estimated"]) >= 2
+
+
+class TestMontageForScan:
+    """Per-scan montage resolution backing toeplitz activity."""
+
+    def _scan(self, p):
+        return ScanEntry(format="snirf", path=Path(p), display_name=Path(p).stem)
+
+    def test_none_when_nothing_estimated(self):
+        st = AppState()
+        assert activity_panel._montage_for_scan(st, self._scan("/tmp/x.snirf")) is None
+
+    def test_uses_cached_montage(self):
+        st = AppState()
+        scan = self._scan("/tmp/x.snirf")
+        m = object()
+        st.montage_cache[scan.path.resolve()] = m
+        assert activity_panel._montage_for_scan(st, scan) is m
+
+    def test_falls_back_to_single_montage_when_source_matches(self):
+        st = AppState()
+        scan = self._scan("/tmp/x.snirf")
+        m = object()
+        st.montage = m
+        st.montage_source_scan = scan
+        assert activity_panel._montage_for_scan(st, scan) is m
+
+    def test_ignores_single_montage_for_other_scan(self):
+        st = AppState()
+        st.montage = object()
+        st.montage_source_scan = self._scan("/tmp/a.snirf")
+        assert activity_panel._montage_for_scan(st, self._scan("/tmp/b.snirf")) is None
+
+    def test_montage_cache_cleared_on_reset(self):
+        st = AppState()
+        st.montage_cache[Path("/tmp/x")] = object()
+        st.reset()
+        assert st.montage_cache == {}

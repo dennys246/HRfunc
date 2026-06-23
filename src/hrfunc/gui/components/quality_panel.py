@@ -6,8 +6,14 @@ that researchers can use to QC scans before publication. Two views:
 - **Per-scan** (default): metrics for the currently-selected scan in
   whichever stages are cached. ``raw_cache`` provides the source signal
   for SCI; ``processed_cache`` provides preprocessed signal for
-  skewness/kurtosis/SNR; ``activity_raw`` (when the source scan matches
-  the selected scan) provides deconvolved signal for the same triplet.
+  skewness/kurtosis/SNR/variance; ``activity_cache`` (per scan) provides
+  the deconvolved signal for the same set. Beyond the stage-summary table,
+  a **channel-wise** table compares each channel across the three stages
+  (raw → hemoglobin → activity) with Δ (activity − hemoglobin) and ratio
+  (activity / hemoglobin) columns — the QC outcome for how much
+  deconvolution changed each channel. The raw column is mapped to a
+  haemoglobin channel by its source-detector prefix (raw wavelength
+  channels share the S-D pair).
 - **Dataset-wide aggregate**: a "Run on all scans" button kicks off a
   background task that walks every scan in the manifest, loading +
   preprocessing each (using library defaults) and computing the same
@@ -56,17 +62,28 @@ STAGE_DECONVOLVED = "deconvolved"
 class QualityMetrics:
     """Per-stage signal-quality summary.
 
-    Each field is a scalar averaged across channels. None for metrics that
-    weren't computable on the given stage (e.g. SCI is only meaningful on
-    raw fNIRS data in optical-amplitude units; it returns None for the
-    preprocessed/deconvolved stages).
+    The ``*_mean`` fields are scalars averaged across channels (used by the
+    dataset-wide aggregate plot and the stage-summary table). The
+    ``*_by_channel`` dicts map channel name -> value and drive the
+    channel-wise 3-stage table. None for metrics that weren't computable on
+    the given stage (e.g. SCI is only meaningful on raw fNIRS data in
+    optical-amplitude units; it is None for the preprocessed/deconvolved
+    stages).
     """
 
     snr_mean: Optional[float] = None
     skew_mean: Optional[float] = None
     kurtosis_mean: Optional[float] = None
+    variance_mean: Optional[float] = None
     sci_mean: Optional[float] = None
     n_channels: int = 0
+
+    # Per-channel breakdowns (channel name -> value). None when not computed.
+    snr_by_channel: Optional[Dict[str, float]] = None
+    skew_by_channel: Optional[Dict[str, float]] = None
+    kurtosis_by_channel: Optional[Dict[str, float]] = None
+    variance_by_channel: Optional[Dict[str, float]] = None
+    sci_by_channel: Optional[Dict[str, float]] = None
 
 
 def render(state: AppState) -> None:
@@ -154,33 +171,271 @@ def _render_per_scan(state: AppState, scan: ScanEntry) -> None:
                         ui.spinner(size="sm")
                         ui.label("Working…").classes("text-sm opacity-70")
         else:
-            _render_metrics_table(cached)
-            # A cached entry computed BEFORE Activity ran holds only the
-            # raw + preprocessed stages; nothing invalidates it when Activity
-            # later produces a deconvolved Raw for this scan. Offer an
-            # explicit recompute (the panel otherwise only shows the compute
-            # button on the empty branch) so the deconvolved row can be added
-            # without a full project reset.
-            deconv_available = (
-                STAGE_DECONVOLVED not in cached
-                and state.activity_raw is not None
-                and state.montage_source_scan is not None
-                and state.montage_source_scan.path == scan.path
-            )
-            with ui.row().classes("items-center gap-3 mt-2"):
-                recompute_disabled = (
-                    state.busy or scan not in state.processed_cache
-                )
+            # Offer a recompute so users can refresh after deconvolving (the
+            # cached metrics may predate the activity stage).
+            with ui.row().classes("items-center gap-2"):
                 ui.button(
-                    "Recompute metrics",
+                    "Recompute",
                     icon="refresh",
                     on_click=lambda: _run_per_scan(state, scan),
-                ).props(f"flat dense {'disable' if recompute_disabled else ''}")
-                if deconv_available:
+                ).props(f"flat dense {'disable' if state.busy else ''}")
+                if (
+                    STAGE_DECONVOLVED not in cached
+                    and scan in state.activity_cache
+                ):
                     ui.label(
-                        "Activity result available — recompute to add the "
-                        "deconvolved row."
-                    ).classes("text-sm opacity-60")
+                        "Activity available — recompute to include it."
+                    ).classes("text-xs opacity-60")
+            _render_metrics_table(cached)
+            ui.separator()
+            _render_channel_wise(state, scan, cached)
+
+
+# Metrics exposed in the channel-wise table, in display order.
+# (key on QualityMetrics, label). SCI is raw-only and handled separately.
+_CHANNEL_METRICS = (
+    ("snr_by_channel", "SNR"),
+    ("variance_by_channel", "Variance"),
+    ("skew_by_channel", "Skewness"),
+    ("kurtosis_by_channel", "Kurtosis"),
+)
+
+
+def _sd_prefix(ch_name: str) -> str:
+    """Source-detector prefix of a channel name ("S1_D1 hbo" -> "S1_D1").
+
+    Used to map a haemoglobin channel back to its raw wavelength channels,
+    which share the S-D pair but differ by the trailing chromophore /
+    wavelength token.
+    """
+    return ch_name.rsplit(" ", 1)[0] if " " in ch_name else ch_name
+
+
+def _raw_value_for(
+    raw_by_channel: Optional[Dict[str, float]], hemo_ch: str
+) -> Optional[float]:
+    """Raw-stage value for a haemoglobin channel, averaged over the raw
+    wavelength channels that share its source-detector pair."""
+    if not raw_by_channel:
+        return None
+    prefix = _sd_prefix(hemo_ch)
+    vals = [
+        v for ch, v in raw_by_channel.items()
+        if _sd_prefix(ch) == prefix and v is not None
+    ]
+    if not vals:
+        return None
+    return float(np.nanmean(vals))
+
+
+def _render_channel_wise(
+    state: AppState, scan: ScanEntry, stages_metrics: Dict[str, QualityMetrics]
+) -> None:
+    """Channel-wise QC across raw / hemoglobin / activity stages.
+
+    Rows are keyed by the haemoglobin (preprocessed) channel names — the
+    hemoglobin and activity stages align 1:1 there, so the Δ (activity −
+    hemoglobin) and ratio (activity / hemoglobin) columns are exact. The raw
+    column is mapped by source-detector prefix (raw wavelength channels share
+    the S-D pair), shown as a reference. One tab per metric.
+    """
+    hemo = stages_metrics.get(STAGE_PREPROCESSED)
+    raw_m = stages_metrics.get(STAGE_RAW)
+    act = stages_metrics.get(STAGE_DECONVOLVED)
+
+    ui.label("Channel-wise QC (raw → hemoglobin → activity)").classes(
+        "text-xs uppercase opacity-60 tracking-wide"
+    )
+
+    if hemo is None or not hemo.snr_by_channel and not hemo.variance_by_channel:
+        ui.label(
+            "Preprocess this scan to populate the channel-wise table."
+        ).classes("text-sm opacity-60")
+        return
+
+    if act is None:
+        with ui.row().classes("items-center gap-2"):
+            ui.icon("info").classes("text-amber-500")
+            ui.label(
+                "Deconvolve this scan on the Activity tab to fill the "
+                "activity / Δ / ratio columns."
+            ).classes("text-sm opacity-70")
+
+    # Channel order from the hemoglobin stage (the alignment key).
+    channels = sorted(
+        (hemo.variance_by_channel or hemo.snr_by_channel or {}).keys()
+    )
+    if not channels:
+        ui.label("No channels to display.").classes("text-sm opacity-60")
+        return
+
+    with ui.tabs().props("dense").classes("w-full") as metric_tabs:
+        for _key, label in _CHANNEL_METRICS:
+            ui.tab(label)
+    first_label = _CHANNEL_METRICS[0][1]
+    with ui.tab_panels(metric_tabs, value=first_label).classes("w-full"):
+        for key, label in _CHANNEL_METRICS:
+            with ui.tab_panel(label).classes("p-0"):
+                png = _render_channel_bar_png(
+                    key, label, channels, raw_m, hemo, act
+                )
+                if png is not None:
+                    ui.image(png).classes("w-full max-w-4xl")
+                _render_channel_metric_table(key, channels, raw_m, hemo, act)
+
+    # SCI is raw-only; surface it as a compact reference table when present.
+    if raw_m is not None and raw_m.sci_by_channel:
+        ui.label("Scalp coupling index (raw only)").classes(
+            "text-xs uppercase opacity-50 tracking-wide pt-2"
+        )
+        sci_rows = [
+            {"channel": ch, "sci": _format_metric(v)}
+            for ch, v in sorted(raw_m.sci_by_channel.items())
+        ]
+        ui.table(
+            columns=[
+                {"name": "channel", "label": "Channel", "field": "channel", "align": "left"},
+                {"name": "sci", "label": "SCI", "field": "sci", "align": "right"},
+            ],
+            rows=sci_rows,
+            row_key="channel",
+        ).classes("w-full").props("dense flat")
+
+
+def _render_channel_metric_table(
+    metric_key: str,
+    channels: List[str],
+    raw_m: Optional[QualityMetrics],
+    hemo: QualityMetrics,
+    act: Optional[QualityMetrics],
+) -> None:
+    """One metric's channel table: raw | hemoglobin | activity | Δ | ratio."""
+    raw_by = getattr(raw_m, metric_key) if raw_m is not None else None
+    hemo_by = getattr(hemo, metric_key) or {}
+    act_by = getattr(act, metric_key) if act is not None else None
+
+    rows = []
+    for ch in channels:
+        hemo_v = hemo_by.get(ch)
+        act_v = act_by.get(ch) if act_by else None
+        raw_v = _raw_value_for(raw_by, ch)
+
+        delta = (
+            act_v - hemo_v
+            if (act_v is not None and hemo_v is not None) else None
+        )
+        ratio = (
+            act_v / hemo_v
+            if (act_v is not None and hemo_v not in (None, 0)) else None
+        )
+        rows.append(
+            {
+                "channel": ch,
+                "raw": _format_metric(raw_v),
+                "hemo": _format_metric(hemo_v),
+                "activity": _format_metric(act_v),
+                "delta": _format_metric(delta),
+                "ratio": _format_metric(ratio),
+            }
+        )
+
+    ui.table(
+        columns=[
+            {"name": "channel", "label": "Channel", "field": "channel", "align": "left", "sortable": True},
+            {"name": "raw", "label": "Raw", "field": "raw", "align": "right", "sortable": True},
+            {"name": "hemo", "label": "Hemoglobin", "field": "hemo", "align": "right", "sortable": True},
+            {"name": "activity", "label": "Activity", "field": "activity", "align": "right", "sortable": True},
+            {"name": "delta", "label": "Δ (act−hemo)", "field": "delta", "align": "right", "sortable": True},
+            {"name": "ratio", "label": "Ratio (act/hemo)", "field": "ratio", "align": "right", "sortable": True},
+        ],
+        rows=rows,
+        row_key="channel",
+        pagination=0,
+    ).classes("w-full").props("dense flat")
+
+
+def _render_channel_bar_png(
+    metric_key: str,
+    label: str,
+    channels: List[str],
+    raw_m: Optional[QualityMetrics],
+    hemo: QualityMetrics,
+    act: Optional[QualityMetrics],
+) -> Optional[str]:
+    """Grouped bar chart of one metric per channel across the stages.
+
+    One cluster of bars per channel — raw / hemoglobin / activity — so the
+    per-channel quality and the hemoglobin → activity change are visible at a
+    glance. Stages with no data (e.g. activity before deconvolution) are
+    omitted. Returns a base64 PNG data URI, or None if nothing to plot.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg", force=False)
+        import matplotlib.pyplot as plt
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("matplotlib unavailable for channel bars: %s", exc)
+        return None
+
+    raw_by = getattr(raw_m, metric_key) if raw_m is not None else None
+    hemo_by = getattr(hemo, metric_key) or {}
+    act_by = getattr(act, metric_key) if act is not None else None
+
+    # One series per available stage (skip a stage with no usable values).
+    # Fixed colors: raw=orange, hemoglobin=red, neural activity=blue.
+    stage_colors = {
+        "Raw": "#ff7f0e",          # orange
+        "Hemoglobin": "#d62728",   # red
+        "Activity": "#1f77b4",     # blue
+    }
+    series: List[Tuple[str, List[float]]] = []
+    raw_vals = [_raw_value_for(raw_by, ch) for ch in channels]
+    hemo_vals = [hemo_by.get(ch) for ch in channels]
+    act_vals = [act_by.get(ch) if act_by else None for ch in channels]
+    for name, vals in (
+        ("Raw", raw_vals),
+        ("Hemoglobin", hemo_vals),
+        ("Activity", act_vals),
+    ):
+        if any(v is not None for v in vals):
+            series.append(
+                (name, [v if v is not None else np.nan for v in vals])
+            )
+    if not series:
+        return None
+
+    fig = None
+    try:
+        n = len(channels)
+        n_series = len(series)
+        x = np.arange(n)
+        # Bars share each channel's slot; width scales with series count.
+        width = 0.8 / n_series
+        fig, ax = plt.subplots(1, 1, figsize=(max(8, n * 0.5), 4))
+        for i, (name, vals) in enumerate(series):
+            offset = (i - (n_series - 1) / 2.0) * width
+            ax.bar(
+                x + offset, vals, width, label=name,
+                color=stage_colors.get(name),
+            )
+        ax.set_xticks(x)
+        ax.set_xticklabels(channels, rotation=60, ha="right", fontsize=8)
+        ax.set_ylabel(label)
+        ax.set_title(f"Per-channel {label} by stage")
+        ax.axhline(0, color="black", linewidth=0.6)
+        ax.legend(loc="upper right", fontsize=8)
+        fig.tight_layout()
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
+        encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+        return f"data:image/png;base64,{encoded}"
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("channel bar render failed: %s", exc)
+        return None
+    finally:
+        if fig is not None:
+            plt.close(fig)
 
 
 def _render_metrics_table(stages_metrics: Dict[str, QualityMetrics]) -> None:
@@ -194,6 +449,7 @@ def _render_metrics_table(stages_metrics: Dict[str, QualityMetrics]) -> None:
             {
                 "stage": stage_name,
                 "snr": _format_metric(m.snr_mean),
+                "variance": _format_metric(m.variance_mean),
                 "skew": _format_metric(m.skew_mean),
                 "kurtosis": _format_metric(m.kurtosis_mean),
                 "sci": _format_metric(m.sci_mean),
@@ -205,6 +461,7 @@ def _render_metrics_table(stages_metrics: Dict[str, QualityMetrics]) -> None:
         columns=[
             {"name": "stage", "label": "Stage", "field": "stage", "align": "left"},
             {"name": "snr", "label": "SNR", "field": "snr", "align": "right"},
+            {"name": "variance", "label": "Variance", "field": "variance", "align": "right"},
             {"name": "skew", "label": "Skewness", "field": "skew", "align": "right"},
             {"name": "kurtosis", "label": "Kurtosis", "field": "kurtosis", "align": "right"},
             {"name": "sci", "label": "SCI", "field": "sci", "align": "right"},
@@ -288,11 +545,15 @@ def _run_per_scan(state: AppState, scan: ScanEntry) -> None:
     raw_obj = state.raw_cache.get(scan) if scan in state.raw_cache else None
     processed_obj = state.processed_cache.get(scan)
     deconvolved_obj = None
-    if (
+    if scan in state.activity_cache:
+        # Per-scan deconvolution cache (any scan the user has run).
+        deconvolved_obj = state.activity_cache.get(scan)
+    elif (
         state.activity_raw is not None
         and state.montage_source_scan is not None
         and state.montage_source_scan.path == scan.path
     ):
+        # Fallback to the single most-recent result for the matching scan.
         deconvolved_obj = state.activity_raw
 
     async def _on_done(result) -> None:
@@ -474,6 +735,7 @@ def _compute_signal_metrics(raw: "mne.io.BaseRaw") -> QualityMetrics:
 
     raw.load_data()
     data = raw.get_data()
+    ch_names = list(raw.ch_names)
     n_ch = data.shape[0]
 
     # axis=1 → per-channel summaries. lens.calc_skewness_and_kurtosis
@@ -482,16 +744,35 @@ def _compute_signal_metrics(raw: "mne.io.BaseRaw") -> QualityMetrics:
     # the per-channel comparison plots downstream actually need.
     skew_vals = skew(data, axis=1)
     kurt_vals = kurtosis(data, axis=1)
+    var_vals = np.var(data, axis=1)
 
-    snr_mean = _compute_snr_safe(raw)
+    skew_by = {ch: float(v) for ch, v in zip(ch_names, skew_vals)}
+    kurt_by = {ch: float(v) for ch, v in zip(ch_names, kurt_vals)}
+    var_by = {ch: float(v) for ch, v in zip(ch_names, var_vals)}
+    snr_by = _compute_snr_by_channel(raw)
 
     return QualityMetrics(
-        snr_mean=snr_mean,
+        snr_mean=_nanmean_or_none(snr_by),
         skew_mean=float(np.nanmean(skew_vals)),
         kurtosis_mean=float(np.nanmean(kurt_vals)),
+        variance_mean=float(np.nanmean(var_vals)),
         sci_mean=None,
         n_channels=n_ch,
+        snr_by_channel=snr_by,
+        skew_by_channel=skew_by,
+        kurtosis_by_channel=kurt_by,
+        variance_by_channel=var_by,
     )
+
+
+def _nanmean_or_none(by_channel: Optional[Dict[str, float]]) -> Optional[float]:
+    """Mean of a by-channel dict's values, or None when absent/empty."""
+    if not by_channel:
+        return None
+    vals = [v for v in by_channel.values() if v is not None]
+    if not vals:
+        return None
+    return float(np.nanmean(vals))
 
 
 def _compute_raw_metrics(raw: "mne.io.BaseRaw") -> QualityMetrics:
@@ -501,23 +782,32 @@ def _compute_raw_metrics(raw: "mne.io.BaseRaw") -> QualityMetrics:
     MNE). If the data isn't suitable, SCI returns None and the rest of
     the metrics still populate.
     """
-    sci_mean = _compute_sci_safe(raw)
+    sci_by = _compute_sci_by_channel(raw)
     base = _compute_signal_metrics(raw)
     return QualityMetrics(
         snr_mean=base.snr_mean,
         skew_mean=base.skew_mean,
         kurtosis_mean=base.kurtosis_mean,
-        sci_mean=sci_mean,
+        variance_mean=base.variance_mean,
+        sci_mean=_nanmean_or_none(sci_by),
         n_channels=base.n_channels,
+        snr_by_channel=base.snr_by_channel,
+        skew_by_channel=base.skew_by_channel,
+        kurtosis_by_channel=base.kurtosis_by_channel,
+        variance_by_channel=base.variance_by_channel,
+        sci_by_channel=sci_by,
     )
 
 
-def _compute_sci_safe(raw: "mne.io.BaseRaw") -> Optional[float]:
-    """SCI mean across channels, None on failure.
+def _compute_sci_by_channel(
+    raw: "mne.io.BaseRaw",
+) -> Optional[Dict[str, float]]:
+    """Per-channel SCI (channel name -> value), None on failure.
 
     SCI is only defined on raw fNIRS cw_amplitude data. Wrapped in
     try/except because passing the wrong channel type raises ValueError
-    in MNE and we want the rest of the metrics to render anyway.
+    in MNE and we want the rest of the metrics to render anyway. Keyed by the
+    optical-density channel names (the raw wavelength channels).
     """
     try:
         import mne
@@ -525,14 +815,16 @@ def _compute_sci_safe(raw: "mne.io.BaseRaw") -> Optional[float]:
         raw_copy = raw.copy().load_data()
         od = mne.preprocessing.nirs.optical_density(raw_copy, verbose="ERROR")
         sci = mne.preprocessing.nirs.scalp_coupling_index(od, verbose="ERROR")
-        return float(np.nanmean(sci))
+        return {ch: float(v) for ch, v in zip(od.ch_names, sci)}
     except Exception as exc:  # noqa: BLE001
         logger.debug("SCI computation skipped: %s", exc)
         return None
 
 
-def _compute_snr_safe(raw: "mne.io.BaseRaw") -> Optional[float]:
-    """PSD-based SNR per lens.calc_snr, averaged across channels.
+def _compute_snr_by_channel(
+    raw: "mne.io.BaseRaw",
+) -> Optional[Dict[str, float]]:
+    """PSD-based per-channel SNR per lens.calc_snr (channel name -> value).
 
     Returns None on any MNE / scipy failure so the calling table still
     renders the skew/kurtosis numbers.
@@ -572,7 +864,9 @@ def _compute_snr_safe(raw: "mne.io.BaseRaw") -> Optional[float]:
         snr_per_channel = signal_power / np.where(
             noise_power > 0, noise_power, np.nan
         )
-        return float(np.nanmean(snr_per_channel))
+        return {
+            ch: float(v) for ch, v in zip(raw.ch_names, snr_per_channel)
+        }
     except Exception as exc:  # noqa: BLE001
         logger.debug("SNR computation skipped: %s", exc)
         return None

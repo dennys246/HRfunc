@@ -1895,6 +1895,7 @@ def _render_viz_pane(state: AppState) -> None:
                 matched,
                 show_brain=state.library_show_brain,
                 show_scalp=state.library_show_scalp,
+                show_info=state.library_show_info,
                 roi_keys=union_roi_keys,
                 roi_shapes=visible_shapes,
             )
@@ -1987,6 +1988,10 @@ def _render_viz_pane(state: AppState) -> None:
                 state.library_show_scalp = bool(event.value)
                 _publish_filter_change()
 
+            def _on_info_toggle(event) -> None:
+                state.library_show_info = bool(event.value)
+                _publish_filter_change()
+
             with ui.row().classes(
                 "w-full items-center justify-center gap-6 shrink-0 pt-1"
             ):
@@ -2005,6 +2010,16 @@ def _render_viz_pane(state: AppState) -> None:
                 ).props("dense").tooltip(
                     "Translucent fsaverage scalp (outer-skin) surface — "
                     "where forehead/head-mounted fNIRS optodes physically sit."
+                )
+                ui.switch(
+                    "Show info",
+                    value=state.library_show_info,
+                    on_change=_on_info_toggle,
+                ).props("dense").tooltip(
+                    "Show the per-HRF metadata popup on hover in the 3D view. "
+                    "Turn off to declutter dense clouds — the detail column on "
+                    "the right stays, and clicks / shift-hover ROI painting "
+                    "still work."
                 )
 
     _viz_body()
@@ -2030,8 +2045,22 @@ def _render_viz_pane(state: AppState) -> None:
     # sees the readout update while the 3D shape stays put.
     def _refresh_viz(_payload=None) -> None:
         _viz_body.refresh()
+
+    def _refresh_viz_after_event(_payload=None) -> None:
+        # Defer the rebuild to the next tick. The HRF click handler
+        # (``_on_click``) lives INSIDE ``_viz_body``; refreshing the body
+        # synchronously from there tears down the very plotly element that's
+        # mid-click, which drops that event's UI update batch — the detail
+        # pane (which refreshes later in the same ``publish``) then wouldn't
+        # repaint until the user's NEXT interaction (e.g. toggling a switch).
+        # Deferring lets the click event finish and flush first, then we
+        # rebuild the viz to re-centre the ROI shape overlay on the new
+        # anchor. once=True so the timer cleans itself up after firing.
+        ui.timer(0.05, _refresh_viz, once=True)
+
     state.subscribe("hrtree_filter_changed", _refresh_viz)
-    state.subscribe("hrtree_selection_changed", _refresh_viz)
+    # Selection comes from a plotly click inside this body, so defer (above).
+    state.subscribe("hrtree_selection_changed", _refresh_viz_after_event)
 
 
 def _extract_clicked_hrf_key(event) -> Optional[str]:
@@ -2095,10 +2124,17 @@ def _render_detail_pane(state: AppState) -> None:
                 ui.label("Context").classes(
                     "text-xs uppercase opacity-60 tracking-wide"
                 )
-                for ctx_key, value in context.items():
-                    if value is None:
-                        continue
-                    _kv(ctx_key, str(value))
+                # Cap the context block to its own scroll area so a long
+                # context (many populated fields) can't push the trace plot
+                # down / squish it — it scrolls within this box instead while
+                # the Trace section below keeps its space.
+                with ui.column().classes(
+                    "w-full max-h-40 overflow-auto gap-1 pr-1 shrink-0"
+                ):
+                    for ctx_key, value in context.items():
+                        if value is None:
+                            continue
+                        _kv(ctx_key, str(value))
 
             if trace:
                 ui.separator()
@@ -2107,7 +2143,9 @@ def _render_detail_pane(state: AppState) -> None:
                 )
                 png = _render_trace_png(hrf)
                 if png is not None:
-                    ui.image(png).classes("max-w-md")
+                    # shrink-0 so the plot keeps its natural size regardless
+                    # of how much context sits above it.
+                    ui.image(png).classes("max-w-md shrink-0")
 
             # ROI average plot (only renders when the ROI has at least
             # 2 averageable same-oxygenation HRFs — fewer than that
@@ -2372,6 +2410,7 @@ def build_plotly_figure(
     *,
     show_brain: bool = False,
     show_scalp: bool = False,
+    show_info: bool = True,
     roi_keys: Optional[Any] = None,
     roi_shape: Optional[Shape] = None,
     roi_shapes: Optional[List[Shape]] = None,
@@ -2492,6 +2531,10 @@ def build_plotly_figure(
             )
             traces.append(make_sphere_overlay_trace(sphere_m))
 
+    # "text" shows the per-HRF metadata popup on hover; "none" hides it but
+    # still fires hover/click events, so ROI clicks + shift-hover paint keep
+    # working with the popups off (the "Show info" toggle).
+    hover_mode = "text" if show_info else "none"
     if hbo_x:
         traces.append(
             go.Scatter3d(
@@ -2512,7 +2555,7 @@ def build_plotly_figure(
                 name="HbO",
                 customdata=hbo_keys,
                 hovertext=hbo_hover,
-                hoverinfo="text",
+                hoverinfo=hover_mode,
             )
         )
     if hbr_x:
@@ -2530,7 +2573,7 @@ def build_plotly_figure(
                 name="HbR",
                 customdata=hbr_keys,
                 hovertext=hbr_hover,
-                hoverinfo="text",
+                hoverinfo=hover_mode,
             )
         )
 
@@ -2565,7 +2608,7 @@ def build_plotly_figure(
                     name=f"ROI ({len(roi_x)})",
                     customdata=roi_keys_list,
                     hovertext=roi_hover,
-                    hoverinfo="text",
+                    hoverinfo=hover_mode,
                 )
             )
 

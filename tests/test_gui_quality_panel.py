@@ -126,6 +126,85 @@ class TestComputePerScanSync:
 
 
 # ---------------------------------------------------------------------------
+# Channel-wise QC helpers (3-stage table)
+# ---------------------------------------------------------------------------
+
+
+class TestChannelWiseHelpers:
+    def test_sd_prefix(self):
+        assert quality_panel._sd_prefix("S1_D1 hbo") == "S1_D1"
+        assert quality_panel._sd_prefix("S1_D1 760") == "S1_D1"
+        assert quality_panel._sd_prefix("nospace") == "nospace"
+
+    def test_nanmean_or_none(self):
+        assert quality_panel._nanmean_or_none(None) is None
+        assert quality_panel._nanmean_or_none({}) is None
+        assert quality_panel._nanmean_or_none({"a": 2.0, "b": 4.0}) == 3.0
+
+    def test_raw_value_for_averages_sd_pair(self):
+        # Two raw wavelength channels share the S1_D1 pair; their mean is the
+        # raw reference for the S1_D1 hbo/hbr haemoglobin channels.
+        raw_by = {"S1_D1 760": 2.0, "S1_D1 850": 4.0, "S2_D1 760": 10.0}
+        assert quality_panel._raw_value_for(raw_by, "S1_D1 hbo") == 3.0
+        assert quality_panel._raw_value_for(raw_by, "S2_D1 hbr") == 10.0
+        assert quality_panel._raw_value_for(raw_by, "S9_D9 hbo") is None
+        assert quality_panel._raw_value_for(None, "S1_D1 hbo") is None
+
+    def test_per_channel_dicts_populated(self):
+        raw = _make_fake_raw()
+        result = quality_panel.compute_per_scan_sync(None, raw, None)
+        m = result[quality_panel.STAGE_PREPROCESSED]
+        # Per-channel breakdowns keyed by channel name; means still present.
+        assert m.skew_by_channel is not None
+        assert set(m.skew_by_channel.keys()) == set(raw.ch_names)
+        assert m.variance_by_channel is not None
+        assert set(m.variance_by_channel.keys()) == set(raw.ch_names)
+        assert m.variance_mean is not None
+        assert m.kurtosis_by_channel is not None
+
+    def test_channel_bar_png_returns_data_uri(self):
+        pytest.importorskip("matplotlib")
+        hemo = quality_panel.QualityMetrics(
+            variance_by_channel={"S1_D1 hbo": 1.0, "S1_D1 hbr": 2.0},
+        )
+        act = quality_panel.QualityMetrics(
+            variance_by_channel={"S1_D1 hbo": 0.5, "S1_D1 hbr": 3.0},
+        )
+        png = quality_panel._render_channel_bar_png(
+            "variance_by_channel", "Variance",
+            ["S1_D1 hbo", "S1_D1 hbr"], None, hemo, act,
+        )
+        assert png is not None
+        assert png.startswith("data:image/png;base64,")
+
+    def test_channel_bar_png_none_when_no_data(self):
+        pytest.importorskip("matplotlib")
+        hemo = quality_panel.QualityMetrics(variance_by_channel={})
+        png = quality_panel._render_channel_bar_png(
+            "variance_by_channel", "Variance", [], None, hemo, None,
+        )
+        assert png is None
+
+
+# ---------------------------------------------------------------------------
+# state.activity_cache lifecycle (per-scan deconvolution for 3-stage QC)
+# ---------------------------------------------------------------------------
+
+
+class TestStateActivityCache:
+    def test_field_exists_and_empty(self):
+        s = AppState()
+        assert s.activity_cache is not None
+        assert len(s.activity_cache._cache) == 0
+
+    def test_reset_clears_activity_cache(self):
+        s = AppState()
+        s.activity_cache._cache[Path("/tmp/x")] = object()
+        s.reset()
+        assert len(s.activity_cache._cache) == 0
+
+
+# ---------------------------------------------------------------------------
 # compute_dataset_sync — manifest loop
 # ---------------------------------------------------------------------------
 

@@ -297,6 +297,37 @@ class TestBuildPlotlyFigure:
         assert len(fig.data) == 0
 
 
+class TestShowInfoToggle:
+    """``show_info`` controls the per-HRF metadata hover popups: ``True``
+    (default) -> hoverinfo "text"; ``False`` -> "none" (tooltip hidden but
+    hover/click events still fire so ROI clicks + paint keep working)."""
+
+    def _hrfs(self):
+        return {
+            "h1": {"location": [1, 2, 3], "oxygenation": True, "context": {}},
+            "h2": {"location": [4, 5, 6], "oxygenation": False, "context": {}},
+        }
+
+    def test_show_info_default_text(self):
+        fig = library.build_plotly_figure(self._hrfs())
+        hrf_traces = [t for t in fig.data if t.name in ("HbO", "HbR")]
+        assert hrf_traces
+        assert all(t.hoverinfo == "text" for t in hrf_traces)
+
+    def test_show_info_false_hides_tooltip(self):
+        fig = library.build_plotly_figure(self._hrfs(), show_info=False)
+        hrf_traces = [t for t in fig.data if t.name in ("HbO", "HbR")]
+        assert hrf_traces
+        assert all(t.hoverinfo == "none" for t in hrf_traces)
+
+    def test_roi_trace_follows_show_info(self):
+        fig = library.build_plotly_figure(
+            self._hrfs(), show_info=False, roi_keys=["h1"],
+        )
+        roi = [t for t in fig.data if (t.name or "").startswith("ROI")]
+        assert roi and all(t.hoverinfo == "none" for t in roi)
+
+
 # ---------------------------------------------------------------------------
 # MNI brain overlay
 # ---------------------------------------------------------------------------

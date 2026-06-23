@@ -180,6 +180,18 @@ def _render(state: AppState) -> None:
     state.subscribe(
         "navigate_preprocess", lambda *_: tabs.set_value(TAB_PREPROCESS)
     )
+    # The Activity tab publishes ``navigate_estimate`` when the chosen HRF
+    # source is "estimated HRFs" but none are in memory yet — linking the
+    # user straight to the HRFs tab to estimate them.
+    state.subscribe(
+        "navigate_estimate", lambda *_: tabs.set_value(TAB_ESTIMATE)
+    )
+    # The Activity tab publishes ``navigate_hrtree`` when the chosen HRF
+    # source is "HRtree HRF" but none is selected — linking the user to the
+    # HRtree tab to pick one.
+    state.subscribe(
+        "navigate_hrtree", lambda *_: tabs.set_value(TAB_HRTREE)
+    )
 
 
 # ---------------------------------------------------------------------------

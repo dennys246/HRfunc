@@ -46,9 +46,13 @@ from nicegui import background_tasks, ui
 
 from ..state import AppState
 from ..workers import (
+    capture_client,
+    client_scope,
     make_progress_callback,
+    notify_if_alive,
     run_bulk_in_background,
     run_in_background,
+    summarize_failures,
 )
 from ...io.manifest import ScanEntry
 from .hrf_panel import _CanonicalResult
@@ -61,9 +65,54 @@ logger = logging.getLogger(__name__)
 
 MODEL_TOEPLITZ = "toeplitz"
 MODEL_CANONICAL = "canonical"
+MODEL_LIBRARY = "library"
 DEFAULT_LMBDA = 1e-4
 LOG_LMBDA_MIN = -6
 LOG_LMBDA_MAX = -1
+# Per-channel solve timeout (s); mirrors montage.estimate_activity's default.
+DEFAULT_TIMEOUT = 30.0
+
+# Human-readable names for the HRF sources estimate_activity supports.
+# Drives the right-column "HRF source" selector and the left-column readout.
+SOURCE_LABELS = {
+    MODEL_TOEPLITZ: "Estimated HRFs (from the HRFs tab)",
+    MODEL_CANONICAL: "Canonical reference HRF (library)",
+    MODEL_LIBRARY: "HRtree HRF (selected in the HRtree tab)",
+}
+
+
+def _library_kernel_from_state(state: AppState):
+    """The (trace, oxygenation) of the HRtree HRF selected for deconvolution.
+
+    Reads ``state.library_selected_hrf`` (the HRF the user clicked in the
+    HRtree tab). Returns ``(trace_list, oxygenation_bool)`` or ``None`` when no
+    HRF is selected / it has no usable mean trace.
+    """
+    hrf = getattr(state, "library_selected_hrf", None)
+    if not hrf:
+        return None
+    trace = hrf.get("hrf_mean") or []
+    if not len(trace):
+        return None
+    return list(trace), bool(hrf.get("oxygenation"))
+
+
+def _snapshot_options(state: AppState, opts: "ActivityOptions") -> "ActivityOptions":
+    """Snapshot ActivityOptions for a background run, capturing the HRtree
+    kernel when in library mode so the run sees a stable trace."""
+    kernel = (
+        _library_kernel_from_state(state)
+        if opts.hrf_model == MODEL_LIBRARY else None
+    )
+    return ActivityOptions(
+        hrf_model=opts.hrf_model,
+        lmbda=opts.lmbda,
+        preview_channel=opts.preview_channel,
+        timeout=opts.timeout,
+        drop_failed_channels=opts.drop_failed_channels,
+        library_trace=kernel[0] if kernel else None,
+        library_oxygenation=kernel[1] if kernel else True,
+    )
 
 
 @dataclass
@@ -77,6 +126,16 @@ class ActivityOptions:
     hrf_model: str = MODEL_TOEPLITZ
     lmbda: float = DEFAULT_LMBDA
     preview_channel: int = 0
+    # Per-channel lstsq solve timeout (seconds) and whether a failed channel
+    # is dropped (scan continues) vs aborting the whole scan. Forwarded to
+    # montage.estimate_activity.
+    timeout: float = DEFAULT_TIMEOUT
+    drop_failed_channels: bool = True
+    # Snapshot of the HRtree kernel for hrf_model == MODEL_LIBRARY, captured at
+    # Run-click so a background run sees a stable trace even if the HRtree
+    # selection changes mid-run. None in other modes.
+    library_trace: Optional[list] = None
+    library_oxygenation: bool = True
 
 
 def render(state: AppState) -> None:
@@ -102,6 +161,11 @@ def render(state: AppState) -> None:
     state.subscribe("preprocess_done", _refresh)
     state.subscribe("hrf_estimated", _refresh)
     state.subscribe("activity_estimated", _refresh)
+    # Recompute bulk mode when the dataset-tree checked set changes.
+    state.subscribe("checked_changed", _refresh)
+    # Update the "HRtree HRF" source status when the user picks an HRF in the
+    # HRtree tab (so the kernel readout / Run gating refresh live).
+    state.subscribe("hrtree_selection_changed", _refresh)
 
     def _poll_progress() -> None:
         if state.busy and state.estimation_progress is not None:
@@ -130,60 +194,175 @@ def _render_body(state: AppState, opts: ActivityOptions) -> None:
             ).classes("text-sm opacity-60")
             return
 
-        if bulk_mode:
-            ui.label(
-                f"Bulk run on {len(checked_scans)} checked scan"
-                f"{'s' if len(checked_scans) != 1 else ''}."
-            ).classes("text-sm font-mono opacity-70")
-            if opts.hrf_model == MODEL_TOEPLITZ:
-                # Toeplitz bulk needs per-scan estimated HRFs, but
-                # ``state.montage`` is single-valued. The bulk worker
-                # will skip scans whose montage_source_scan doesn't
-                # match -- in practice that's every scan except whichever
-                # one the user last ran HRFs on. Canonical bulk works
-                # universally.
-                ui.label(
-                    "Toeplitz mode in bulk only succeeds on the scan "
-                    "whose HRFs are currently in memory; other scans "
-                    "will be skipped. Switch to canonical for an "
-                    "every-scan deconvolution."
-                ).classes("text-xs opacity-60 italic")
-        elif scan is not None:
-            ui.label(scan.display_name or scan.path.name).classes(
-                "text-sm font-mono opacity-70"
+        # Two-column workspace: deconvolution controls on the left, the HRF
+        # source picker + preview in its own column on the right (mirrors the
+        # HRFs / HRtree tabs). The right column makes it explicit WHICH HRFs
+        # the deconvolution will use, and links to the HRFs tab when the
+        # chosen source isn't ready yet.
+        with ui.row().classes("w-full gap-6 items-start no-wrap"):
+            with ui.column().classes("flex-1 min-w-0 gap-4"):
+                if bulk_mode:
+                    ui.label(
+                        f"Bulk run on {len(checked_scans)} checked scan"
+                        f"{'s' if len(checked_scans) != 1 else ''}."
+                    ).classes("text-sm font-mono opacity-70")
+                elif scan is not None:
+                    ui.label(scan.display_name or scan.path.name).classes(
+                        "text-sm font-mono opacity-70"
+                    )
+
+                # Shared filename options for the Save action; created here so
+                # the inputs (inside the Deconvolution card) and the Save
+                # button (in the run row) read/write the same dict.
+                naming = {"postfix": "_deconvolved", "ext": ".snirf"}
+
+                # ── Parameter controls. HRF-source selection lives in the
+                # right column; here we show the current source as a readout
+                # plus the regularization control, then the save options as a
+                # subsection at the bottom.
+                with ui.card().classes("w-full"):
+                    ui.label("Deconvolution").classes(
+                        "text-xs uppercase opacity-60 tracking-wide"
+                    )
+                    ui.label(
+                        f"HRF source: {SOURCE_LABELS[opts.hrf_model]}"
+                    ).classes("text-sm opacity-70")
+                    ui.label("Choose the source in the panel on the right.").classes(
+                        "text-xs opacity-50"
+                    )
+                    _render_lmbda_slider(opts)
+                    _render_deconv_controls(opts)
+                    # Save-output subsection (filename postfix + format).
+                    _render_save_options(state, scan, checked_scans, naming)
+
+                # ── Run row: Estimate + Save on the same horizontal level,
+                # then progress / errors.
+                _render_run_row(state, scan, checked_scans, opts, naming)
+
+                # ── Deconvolved preview (single-scan only -- bulk overwrites
+                # activity_raw). Gate on activity_source_scan: activity_raw is
+                # a single global slot NOT cleared when the selected scan
+                # changes, so without this check the preview would overlay scan
+                # A's deconvolution against scan B's preprocessed Raw (channel
+                # names overlap across a shared montage, so it renders silently
+                # rather than erroring).
+                activity_matches = (
+                    scan is not None
+                    and state.activity_source_scan is not None
+                    and state.activity_source_scan.path == scan.path
+                )
+                if (
+                    state.activity_raw is not None
+                    and activity_matches
+                    and not bulk_mode
+                ):
+                    ui.separator()
+                    ui.label("Deconvolved preview").classes(
+                        "text-xs uppercase opacity-60 tracking-wide"
+                    )
+                    _render_preview(state, scan, opts)
+
+            # ── Right column: HRF source picker + status + visualization
+            with ui.column().classes("flex-1 min-w-0 gap-3"):
+                _render_hrf_source_column(state, scan, opts, bulk_mode)
+
+
+def _can_save(
+    state: AppState,
+    scan: Optional[ScanEntry],
+    checked_scans: List[ScanEntry],
+) -> bool:
+    """Whether a Save action is available: an in-memory result for the current
+    scan, or one or more checked scans to estimate-and-save in bulk."""
+    has_current = state.activity_raw is not None and scan is not None
+    can_mass = len(checked_scans) >= 1
+    return has_current or can_mass
+
+
+def _render_save_options(
+    state: AppState,
+    scan: Optional[ScanEntry],
+    checked_scans: List[ScanEntry],
+    naming: dict,
+) -> None:
+    """Filename postfix + format inputs for the Save action.
+
+    Rendered as a subsection at the bottom of the Deconvolution card; the
+    Save button itself lives in the run row beside Estimate. Shares ``naming``
+    with that button so the chosen postfix / format reach the save call.
+    """
+    if not _can_save(state, scan, checked_scans):
+        return
+    ui.separator()
+    ui.label("Save deconvolved output").classes(
+        "text-xs uppercase opacity-60 tracking-wide"
+    )
+    with ui.row().classes("items-center gap-3 flex-wrap"):
+        ui.input(
+            label="Filename postfix",
+            value=naming["postfix"],
+            on_change=lambda e: naming.__setitem__("postfix", e.value or ""),
+        ).props("dense outlined").classes("w-44")
+        ui.select(
+            {".snirf": "SNIRF (.snirf)", ".fif": "FIF (.fif)"},
+            value=naming["ext"],
+            label="Format",
+            on_change=lambda e: naming.__setitem__("ext", e.value or ".snirf"),
+        ).props("dense outlined").classes("w-40")
+
+
+def _render_save_button(
+    state: AppState,
+    scan: Optional[ScanEntry],
+    checked_scans: List[ScanEntry],
+    naming: dict,
+) -> None:
+    """The Save button (rendered beside Estimate in the run row).
+
+    Save is INDEPENDENT of Estimate — it writes results that already exist, it
+    never re-estimates. With scans checked it's a batch: save every checked
+    scan that has been estimated (``state.activity_cache``) to a folder;
+    otherwise it saves the single in-memory deconvolved result for the current
+    scan. When checked scans exist but none have been estimated yet, the button
+    is disabled with a hint. Filename postfix / format come from ``naming``.
+    """
+    has_current = state.activity_raw is not None and scan is not None
+    bulk_mode = len(checked_scans) >= 1
+
+    if bulk_mode:
+        cached = [s for s in checked_scans if s in state.activity_cache]
+        if not cached:
+            ui.button("Save", icon="save").props(
+                "outline color=primary disable"
+            ).tooltip(
+                "Estimate the checked scans first — Save does not re-estimate."
             )
+            return
 
-        # ── Mode + parameter controls
-        with ui.card().classes("w-full"):
-            ui.label("Estimation").classes(
-                "text-xs uppercase opacity-60 tracking-wide"
-            )
-            _render_model_radio(state, opts)
-            _render_lmbda_slider(opts)
+        async def _save() -> None:
+            await _mass_save_activity(state, cached, naming)
 
-            if opts.hrf_model == MODEL_TOEPLITZ and scan is not None:
-                _render_toeplitz_requirements(state, scan)
-
-        # ── Run row + progress + errors
-        _render_run_row(state, scan, checked_scans, opts)
-
-        # ── Preview (single-scan only -- bulk overwrites activity_raw).
-        # Gate on activity_source_scan: activity_raw is a single global slot
-        # that is NOT cleared when the selected scan changes, so without this
-        # check the preview overlays scan A's deconvolved Raw against scan B's
-        # preprocessed Raw (channel names overlap across a shared montage, so
-        # the mismatch renders silently rather than erroring).
-        activity_matches = (
-            scan is not None
-            and state.activity_source_scan is not None
-            and state.activity_source_scan.path == scan.path
+        n = len(cached)
+        ui.button(
+            "Save", icon="save", on_click=_save,
+        ).props(
+            f"outline color=primary {'disable' if state.busy else ''}"
+        ).tooltip(
+            f"Saves {n} already-estimated scan"
+            f"{'s' if n != 1 else ''} to a folder (no re-estimation)."
         )
-        if state.activity_raw is not None and activity_matches and not bulk_mode:
-            ui.separator()
-            ui.label("Deconvolved preview").classes(
-                "text-xs uppercase opacity-60 tracking-wide"
-            )
-            _render_preview(state, scan, opts)
+        return
+
+    if has_current:
+        async def _save() -> None:
+            from .export_panel import _save_activity
+            await _save_activity(state, scan, naming)
+
+        ui.button(
+            "Save", icon="save", on_click=_save,
+        ).props("outline color=primary").tooltip(
+            "Saves the deconvolved current scan."
+        )
 
 
 def _resolve_checked_scans(state: AppState) -> List[ScanEntry]:
@@ -200,18 +379,255 @@ def _resolve_checked_scans(state: AppState) -> List[ScanEntry]:
     ]
 
 
-def _render_model_radio(state: AppState, opts: ActivityOptions) -> None:
-    def _set(value: str) -> None:
+def _render_hrf_source_column(
+    state: AppState,
+    scan: Optional[ScanEntry],
+    opts: ActivityOptions,
+    bulk_mode: bool,
+) -> None:
+    """Right column: pick the HRF source, show its readiness, preview it.
+
+    ``estimate_activity`` supports three sources:
+
+    - **Estimated HRFs** (toeplitz): the per-channel HRFs from the HRFs tab
+      (``state.montage``). If none are in memory / they're for another scan,
+      the column says so and offers a "Go to HRFs tab" jump.
+    - **HRtree HRF** (library): a single HRF selected in the HRtree tab, used
+      as the kernel for every channel. Offers a "Go to HRtree tab" jump when
+      nothing is selected.
+    - **Canonical reference** (canonical): a fixed SPM double-gamma from the
+      bundled library — always available, no estimation required.
+
+    The selector sits at the top; the body below reflects the choice so the
+    user can always see which HRFs the deconvolution will actually use.
+    """
+    ui.label("HRF source").classes(
+        "text-xs uppercase opacity-60 tracking-wide"
+    )
+
+    def _set_source(value: str) -> None:
         opts.hrf_model = value
-        # Trigger a body re-render so toeplitz-requirements text appears/
-        # disappears with the selection.
+        # Re-render the body so the readout (left) and status (right) track
+        # the new source.
         state.publish("scan_selected", state.selected_scan)
 
     ui.radio(
-        [MODEL_TOEPLITZ, MODEL_CANONICAL],
+        SOURCE_LABELS,
         value=opts.hrf_model,
-        on_change=lambda e: _set(e.value),
-    ).props("inline")
+        on_change=lambda e: _set_source(e.value),
+    ).props("dense").classes("w-full")
+
+    ui.separator()
+
+    if opts.hrf_model == MODEL_TOEPLITZ:
+        _render_estimated_source_status(state, scan, bulk_mode)
+    elif opts.hrf_model == MODEL_LIBRARY:
+        _render_library_source_status(state)
+    else:
+        _render_canonical_source_status(state, scan)
+
+
+def _go_to_hrfs_button(state: AppState) -> None:
+    """A "Go to HRFs tab" jump button (publishes ``navigate_estimate``)."""
+    with ui.row().classes("items-center gap-2"):
+        ui.icon("arrow_forward").classes("text-primary")
+        ui.button(
+            "Go to HRFs tab to estimate",
+            icon="show_chart",
+            on_click=lambda: state.publish("navigate_estimate"),
+        ).props("flat dense color=primary")
+
+
+def _go_to_hrtree_button(state: AppState) -> None:
+    """A "Go to HRtree tab" jump button (publishes ``navigate_hrtree``)."""
+    with ui.row().classes("items-center gap-2"):
+        ui.icon("arrow_forward").classes("text-primary")
+        ui.button(
+            "Go to HRtree tab to select",
+            icon="account_tree",
+            on_click=lambda: state.publish("navigate_hrtree"),
+        ).props("flat dense color=primary")
+
+
+def _render_library_source_status(state: AppState) -> None:
+    """Status + preview for the "HRtree HRF" (library) source.
+
+    Uses the HRF currently selected in the HRtree tab
+    (``state.library_selected_hrf``) as the single deconvolution kernel for
+    every channel. Prompts the user to the HRtree tab when nothing is picked.
+    """
+    hrf = getattr(state, "library_selected_hrf", None)
+    kernel = _library_kernel_from_state(state)
+
+    if kernel is None:
+        ui.label(
+            "No HRtree HRF selected yet."
+        ).classes("text-sm opacity-70")
+        ui.label(
+            "Open the HRtree tab and click an HRF in the 3D view; it will be "
+            "used as the deconvolution kernel for every channel."
+        ).classes("text-xs opacity-60")
+        _go_to_hrtree_button(state)
+        return
+
+    trace, oxy = kernel
+    key = hrf.get("_key", "") if isinstance(hrf, dict) else ""
+    ui.label(
+        f"Using the HRtree HRF: {key or '(selected HRF)'}"
+    ).classes("text-sm opacity-70")
+    ui.label(
+        f"{'HbO' if oxy else 'HbR'} source · applied to every channel "
+        "(sign-flipped for the opposite oxygenation)."
+    ).classes("text-xs opacity-60")
+    _go_to_hrtree_button(state)
+
+    # Preview the selected kernel shape (reuse the canonical PNG renderer —
+    # it just plots a trace at a given sfreq/duration).
+    try:
+        from .hrf_panel import (
+            _CanonicalResult as _CR,
+            _render_canonical_preview_png,
+        )
+        sfreq = float(hrf.get("sfreq", 0)) if isinstance(hrf, dict) else 0.0
+        if sfreq <= 0:
+            sfreq = 7.81
+        arr = np.asarray(trace, dtype=float)
+        duration = len(arr) / sfreq if sfreq else 30.0
+        png = _render_canonical_preview_png(
+            _CR(canonical_trace=arr, duration=duration, sfreq=sfreq)
+        )
+        if png is not None:
+            ui.image(png).classes("max-w-md")
+            ui.label(
+                "Selected HRtree HRF (mean trace)."
+            ).classes("text-xs opacity-50")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("HRtree kernel preview failed: %s", exc)
+
+
+def _safe_render_gallery(state: AppState, montage) -> None:
+    """Render the per-channel HRF accordion; never blank the panel on error."""
+    try:
+        from .hrf_panel import _render_toeplitz_gallery
+        _render_toeplitz_gallery(state, montage)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("activity HRF-source gallery render failed: %s", exc)
+        ui.label("HRF preview unavailable.").classes("text-sm opacity-60")
+
+
+def _render_estimated_source_status(
+    state: AppState, scan: Optional[ScanEntry], bulk_mode: bool
+) -> None:
+    """Status + preview for the "Estimated HRFs" (toeplitz) source.
+
+    HRFs are cached per scan (``state.montage_cache``), so each scan is
+    deconvolved with its OWN HRFs — single or bulk. Reports this scan's
+    readiness (single mode) or a batch summary (bulk mode).
+    """
+    if bulk_mode:
+        n_cached = len(state.montage_cache)
+        ui.label(
+            "Each checked scan is deconvolved with its own estimated HRFs. "
+            f"{n_cached} scan(s) currently have estimated HRFs; checked scans "
+            "without them are skipped — estimate HRFs for them first."
+        ).classes("text-xs opacity-70 italic")
+        if n_cached == 0:
+            _go_to_hrfs_button(state)
+        montage = _montage_for_scan(state, scan)
+        if montage is not None:
+            _safe_render_gallery(state, montage)
+        return
+
+    montage = _montage_for_scan(state, scan)
+    if montage is not None:
+        ui.label("Using HRFs estimated for this scan.").classes(
+            "text-sm opacity-70"
+        )
+        _safe_render_gallery(state, montage)
+        return
+
+    # Not ready for this scan — tailor the message.
+    if isinstance(state.montage, _CanonicalResult) and not state.montage_cache:
+        ui.label(
+            "Toeplitz mode requires real per-channel HRFs, but the HRFs tab "
+            "last produced a canonical reference shape."
+        ).classes("text-sm opacity-70")
+        ui.label(
+            "Re-run the HRFs tab in toeplitz mode, or switch the source above "
+            "to canonical."
+        ).classes("text-xs opacity-60")
+        _go_to_hrfs_button(state)
+        return
+
+    any_estimated = bool(state.montage_cache) or (
+        state.montage is not None
+        and not isinstance(state.montage, _CanonicalResult)
+    )
+    if not any_estimated:
+        ui.label(
+            "Toeplitz mode requires estimated HRFs — none have been estimated "
+            "yet."
+        ).classes("text-sm opacity-70")
+        ui.label(
+            "Estimate per-channel HRFs first, then return here to deconvolve "
+            "activity with them."
+        ).classes("text-xs opacity-60")
+    else:
+        ui.label(
+            "No estimated HRFs for this scan."
+        ).classes("text-sm opacity-70")
+        ui.label(
+            "Estimate HRFs for this scan (toeplitz), or switch the source "
+            "above to canonical."
+        ).classes("text-xs opacity-60")
+    _go_to_hrfs_button(state)
+
+
+def _render_canonical_source_status(
+    state: AppState, scan: Optional[ScanEntry]
+) -> None:
+    """Status + illustrative curve for the canonical-reference source."""
+    ui.label(
+        "Using the canonical reference HRF — an SPM-style double-gamma shape "
+        "from the bundled library. No estimation needed; works on every scan."
+    ).classes("text-sm opacity-70")
+
+    try:
+        from .hrf_panel import (
+            _CanonicalResult as _CR,
+            _render_canonical_preview_png,
+            canonical_double_gamma,
+        )
+        sfreq = _representative_sfreq(state, scan)
+        trace = canonical_double_gamma(30.0, sfreq)
+        png = _render_canonical_preview_png(
+            _CR(canonical_trace=trace, duration=30.0, sfreq=sfreq)
+        )
+        if png is not None:
+            ui.image(png).classes("max-w-md")
+            ui.label(
+                "Representative shape (30 s window)."
+            ).classes("text-xs opacity-50")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("canonical source preview failed: %s", exc)
+
+
+def _representative_sfreq(
+    state: AppState, scan: Optional[ScanEntry]
+) -> float:
+    """Best-effort sampling rate for the illustrative canonical curve.
+
+    Prefer the scan's processed / raw sfreq when already cached (no load
+    forced); fall back to a sensible fNIRS default otherwise.
+    """
+    if scan is not None:
+        for cache in (state.processed_cache, state.raw_cache):
+            try:
+                if scan in cache:
+                    return float(cache.get(scan).info["sfreq"])
+            except Exception:  # noqa: BLE001
+                continue
+    return 7.81  # typical NIRx sampling rate; illustrative only
 
 
 def _render_lmbda_slider(opts: ActivityOptions) -> None:
@@ -239,50 +655,41 @@ def _render_lmbda_slider(opts: ActivityOptions) -> None:
     )
 
 
-def _render_toeplitz_requirements(state: AppState, scan: ScanEntry) -> None:
-    """Surface the toeplitz-mode dependency on a real estimated Montage.
+def _render_deconv_controls(opts: ActivityOptions) -> None:
+    """Per-channel timeout + drop-failed-channels controls.
 
-    Three blocking conditions:
-    - No Montage yet (HRFs tab not run).
-    - Montage is a _CanonicalResult (HRFs tab last ran in canonical mode,
-      which doesn't produce per-channel traces toeplitz needs).
-    - Montage was produced for a different scan than the one currently
-      selected (Sprint 3.4 review: applying scan A's HRFs to scan B's
-      Raw silently produces wrong results because the library matches
-      by channel name, not scan identity).
+    Both forward to montage.estimate_activity. The timeout bounds each
+    channel's lstsq solve; "Drop failed channels" keeps the scan with its
+    surviving channels when a channel errors (the default) rather than
+    failing the whole scan.
     """
-    montage = state.montage
-    if montage is None:
-        ui.label(
-            "Toeplitz mode requires estimated HRFs from this scan. Run the "
-            "HRFs tab in toeplitz mode first."
-        ).classes("text-sm opacity-70")
-    elif isinstance(montage, _CanonicalResult):
-        ui.label(
-            "Toeplitz mode requires real per-channel HRFs, but the HRFs tab "
-            "last produced a canonical reference shape. Re-run the HRFs tab "
-            "in toeplitz mode or switch the model selector below to "
-            "canonical."
-        ).classes("text-sm opacity-70")
-    elif (
-        state.montage_source_scan is None
-        or state.montage_source_scan.path != scan.path
-    ):
-        source_label = (
-            state.montage_source_scan.display_name
-            or state.montage_source_scan.path.name
-            if state.montage_source_scan is not None
-            else "another scan"
+    with ui.row().classes("items-center gap-3 flex-wrap"):
+        def _on_timeout(event) -> None:
+            try:
+                opts.timeout = max(1.0, float(event.value))
+            except (TypeError, ValueError):
+                opts.timeout = DEFAULT_TIMEOUT
+
+        ui.number(
+            label="Per-channel timeout (s)",
+            value=opts.timeout,
+            min=1.0,
+            step=5.0,
+            format="%.0f",
+            on_change=_on_timeout,
+        ).props("dense outlined").classes("w-48").tooltip(
+            "Seconds to wait for one channel's solve before dropping it."
         )
-        ui.label(
-            f"The current HRFs were estimated from {source_label}, not this "
-            f"scan. Re-run the HRFs tab on this scan in toeplitz mode, or "
-            f"switch the model selector below to canonical."
-        ).classes("text-sm opacity-70")
-    else:
-        ui.label(
-            "Using HRFs estimated in the HRFs tab."
-        ).classes("text-sm opacity-60")
+        ui.checkbox(
+            "Drop failed channels",
+            value=opts.drop_failed_channels,
+            on_change=lambda e: setattr(
+                opts, "drop_failed_channels", bool(e.value)
+            ),
+        ).props("dense").tooltip(
+            "On: a channel that fails is dropped and the scan keeps its good "
+            "channels. Off: any channel failure fails the whole scan."
+        )
 
 
 def _render_run_row(
@@ -290,13 +697,15 @@ def _render_run_row(
     scan: Optional[ScanEntry],
     checked: List[ScanEntry],
     opts: ActivityOptions,
+    naming: dict,
 ) -> None:
-    """Render the Run button row + progress / error display.
+    """Render the Estimate + Save buttons (same row) + progress / errors.
 
     PR #55a: dispatches single vs bulk based on the checked set. Bulk
     button is enabled whenever there's no in-flight task; per-scan gates
     (raw + montage match) are evaluated inside the worker and incompatible
-    scans are skipped.
+    scans are skipped. The Save button sits on the same horizontal level
+    (filename options come from the Deconvolution card via ``naming``).
     """
     bulk_mode = bool(checked)
     if bulk_mode:
@@ -306,18 +715,26 @@ def _render_run_row(
         )
         can_run = not state.busy
     else:
-        raw_ready = scan is not None and scan in state.processed_cache
+        # Activity deconvolution must run on deconvolution-preprocessed data
+        # (not the GLM/haemoglobin pipeline), so require the scan to be in
+        # processed_deconvolved as well as the cache.
+        raw_ready = (
+            scan is not None
+            and scan in state.processed_cache
+            and scan.path.resolve() in state.processed_deconvolved
+        )
         if opts.hrf_model == MODEL_TOEPLITZ:
-            montage_ready = state.montage is not None and not isinstance(
-                state.montage, _CanonicalResult
-            )
-            scan_matches = (
-                state.montage_source_scan is not None
-                and scan is not None
-                and state.montage_source_scan.path == scan.path
-            )
+            # This scan needs its own estimated HRFs (per-scan cache).
             can_run = (
-                raw_ready and montage_ready and scan_matches
+                raw_ready
+                and _montage_for_scan(state, scan) is not None
+                and not state.busy
+            )
+        elif opts.hrf_model == MODEL_LIBRARY:
+            # Library mode needs an HRtree HRF selected as the kernel.
+            can_run = (
+                raw_ready
+                and _library_kernel_from_state(state) is not None
                 and not state.busy
             )
         else:
@@ -330,15 +747,14 @@ def _render_run_row(
             on_click=lambda: _run_dispatch(state, scan, checked, opts),
         ).props(f"color=primary {'disable' if not can_run else ''}")
 
+        # Save sits on the same horizontal level as Estimate.
+        _render_save_button(state, scan, checked, naming)
+
         if state.busy:
             _render_busy_progress(state)
         elif not bulk_mode and scan is not None and scan not in state.processed_cache:
-            # Activity deconvolution runs on the *preprocessed* signal, so
-            # the Run button is disabled until the scan has been through the
-            # Preprocess tab. Spell that out and link straight there rather
-            # than leaving a disabled button with no explanation. The link
-            # goes through the event bus (navigate_preprocess) so this panel
-            # doesn't need a reference to the shell's tab control.
+            # Not preprocessed yet — link straight to the Preprocess tab via
+            # the event bus (no reference to the shell's tab control needed).
             with ui.row().classes("items-center gap-2"):
                 ui.icon("info").classes("text-amber-500")
                 ui.label(
@@ -350,6 +766,17 @@ def _render_run_row(
                     icon="arrow_forward",
                     on_click=lambda: state.publish("navigate_preprocess"),
                 ).props("flat dense color=primary")
+        elif (
+            not bulk_mode and scan is not None
+            and scan.path.resolve() not in state.processed_deconvolved
+        ):
+            # Preprocessed, but GLM/haemoglobin mode — activity needs the
+            # deconvolution pipeline.
+            ui.label(
+                "This scan was preprocessed for haemoglobin (GLM). Neural-"
+                "activity estimation needs the deconvolution pipeline — re-"
+                "preprocess it in deconvolution mode (Preprocess tab)."
+            ).classes("text-sm text-amber-400")
 
     if state.last_error and not state.busy:
         with ui.row().classes("items-center gap-2"):
@@ -410,6 +837,56 @@ def _run_dispatch(
         _run(state, selected, opts)
 
 
+def _montage_for_scan(state: AppState, scan: Optional[ScanEntry]):
+    """The per-channel Montage to use for toeplitz activity on ``scan``.
+
+    Prefers the scan's own cached montage (``state.montage_cache``, populated
+    by every HRF estimate), so toeplitz works per-scan across single and bulk
+    runs. Falls back to the single most-recent ``state.montage`` when it was
+    estimated for this exact scan. Returns None when neither applies.
+    """
+    if scan is None:
+        return None
+    cached = state.montage_cache.get(scan.path.resolve())
+    if cached is not None:
+        return cached
+    if (
+        state.montage is not None
+        and not isinstance(state.montage, _CanonicalResult)
+        and state.montage_source_scan is not None
+        and state.montage_source_scan.path == scan.path
+    ):
+        return state.montage
+    return None
+
+
+def _toeplitz_skip_reason(state: AppState, scan: ScanEntry) -> Optional[str]:
+    """Why this scan can't be deconvolved in toeplitz mode, or None if it can.
+
+    Toeplitz activity needs this scan's own estimated per-channel HRFs. Each
+    scan's montage is cached when HRFs are estimated (single or bulk), so a
+    scan qualifies once it's been estimated. Returns a user-facing reason for
+    the bulk worker to log when it hasn't.
+    """
+    if _montage_for_scan(state, scan) is not None:
+        return None
+    # Nothing estimated anywhere vs. estimated-but-not-this-scan: tailor the hint.
+    any_estimated = bool(state.montage_cache) or (
+        state.montage is not None
+        and not isinstance(state.montage, _CanonicalResult)
+    )
+    if not any_estimated:
+        return (
+            "toeplitz mode needs per-channel HRFs, but none have been "
+            "estimated — estimate HRFs on the HRFs tab first, or switch this "
+            "run to canonical mode (works on every scan)"
+        )
+    return (
+        "no estimated HRFs for this scan — estimate HRFs for it on the HRFs "
+        "tab, or use canonical mode"
+    )
+
+
 def _run_bulk(
     state: AppState,
     scans: List[ScanEntry],
@@ -430,50 +907,64 @@ def _run_bulk(
     if state.busy:
         return
 
-    snapshot = ActivityOptions(
-        hrf_model=opts.hrf_model,
-        lmbda=opts.lmbda,
-        preview_channel=opts.preview_channel,
-    )
+    snapshot = _snapshot_options(state, opts)
 
     def _build(scan: ScanEntry):
-        if scan not in state.processed_cache:
-            return None
         if snapshot.hrf_model == MODEL_TOEPLITZ:
-            if state.montage is None or isinstance(
-                state.montage, _CanonicalResult
-            ):
-                return None
-            if (
-                state.montage_source_scan is None
-                or state.montage_source_scan.path != scan.path
-            ):
-                return None
-            existing_montage = state.montage
+            reason = _toeplitz_skip_reason(state, scan)
+            if reason is not None:
+                return reason  # intentional skip carrying its reason
+            existing_montage = _montage_for_scan(state, scan)
+        elif snapshot.hrf_model == MODEL_LIBRARY:
+            if snapshot.library_trace is None:
+                return (
+                    "no HRtree HRF selected — pick one in the HRtree tab to "
+                    "use as the deconvolution kernel"
+                )
+            existing_montage = None
         else:
             existing_montage = None
 
-        raw = state.processed_cache.get(scan)
         progress_cb = make_progress_callback(state)
-        return (
-            run_activity_sync,
-            (raw, snapshot, existing_montage, progress_cb),
-            {},
-        )
+
+        def _pp_and_estimate(
+            scan=scan, existing_montage=existing_montage, progress_cb=progress_cb,
+        ):
+            # Preprocess on demand (deconvolution) if needed, so the bulk run
+            # triggers the preprocessing each scan needs instead of skipping.
+            # ensure_deconvolved_raw raises a specific reason on failure.
+            from .preprocess_panel import ensure_deconvolved_raw
+            raw = ensure_deconvolved_raw(state, scan)
+            return run_activity_sync(raw, snapshot, existing_montage, progress_cb)
+
+        return (_pp_and_estimate, (), {})
 
     async def _on_each_done(scan: ScanEntry, result) -> None:
         if result is None:
-            return
+            # Raise so an empty deconvolution is reported as a failure with a
+            # reason instead of being silently counted as a success.
+            raise RuntimeError(
+                "deconvolution produced no channels — every channel was "
+                "dropped (check the scan's HRFs and preprocessing)"
+            )
         state.activity_raw = result
+        # Cache per scan so channel-wise 3-stage QC can read each scan's
+        # deconvolution (activity_raw only holds the most-recent one).
+        state.activity_cache._cache[scan.path.resolve()] = result
+        # Track which scan produced activity_raw so the preview won't overlay
+        # one scan's deconvolution against another's preprocessed Raw.
         state.activity_source_scan = scan
         state.publish("activity_estimated", scan)
 
+    client = capture_client()
+
     async def _bulk() -> None:
-        bulk_result = await run_bulk_in_background(
-            state, scans, _build,
-            on_each_done=_on_each_done,
-            label="estimate_activity",
-        )
+        with client_scope(client):
+            bulk_result = await run_bulk_in_background(
+                state, scans, _build,
+                on_each_done=_on_each_done,
+                label="estimate_activity",
+            )
         if bulk_result is None:
             return
         successes, failures = bulk_result
@@ -482,14 +973,109 @@ def _run_bulk(
             f"Estimated activity for {n_ok}/{n_ok + n_fail} scan(s)."
         )
         if failures:
-            fail_names = ", ".join(
-                s.display_name or s.path.name for s, _ in failures[:3]
+            summary += f" Failed/skipped: {summarize_failures(failures)}"
+        # Guarded: the page client may have been deleted during a long run.
+        notify_if_alive(
+            client, summary,
+            type="positive" if n_fail == 0 else "warning",
+            multi_line=True,
+            close_button=True,
+        )
+
+    background_tasks.create(_bulk())
+
+
+async def _mass_save_activity(
+    state: AppState,
+    scans: List[ScanEntry],
+    naming: dict,
+) -> None:
+    """Save the ALREADY-estimated activity for each scan, colocated with its
+    source file.
+
+    For a batch there's no file dialog: each deconvolved scan is written into
+    the SAME folder as its source as ``<stem><postfix><ext>``, after a single
+    confirmation showing the filename format and how many scans will be saved.
+    Save is independent of Estimate — it writes each scan's cached
+    deconvolution (``state.activity_cache``) and never re-estimates; scans
+    with no cached result are skipped with a clear "not estimated yet" reason.
+    Continue-on-error with a final summary toast.
+    """
+    if state.busy:
+        return
+    from .export_panel import _save_raw
+
+    postfix = naming.get("postfix", "_deconvolved")
+    ext = naming.get("ext", ".snirf")
+    n = len(scans)
+    example = f"{scans[0].path.stem}{postfix}{ext}" if scans else f"<scan>{postfix}{ext}"
+
+    # Confirm rather than open a file dialog: each scan saves next to its
+    # source (colocated), so there's no destination to pick.
+    with ui.dialog() as dialog, ui.card().classes("gap-2"):
+        ui.label("Save deconvolved scans").classes("text-base font-semibold")
+        ui.label(
+            f"{n} deconvolved scan{'s' if n != 1 else ''} will be saved next "
+            "to each source file (same folder)."
+        ).classes("text-sm")
+        ui.label(f"Filename format:  <scan>{postfix}{ext}").classes(
+            "text-xs font-mono opacity-70"
+        )
+        ui.label(f"e.g.  {example}").classes("text-xs font-mono opacity-50")
+        with ui.row().classes("justify-end gap-2 w-full"):
+            ui.button("Cancel", on_click=lambda: dialog.submit(False)).props("flat")
+            ui.button("Save", icon="save", on_click=lambda: dialog.submit(True)).props(
+                "color=primary"
             )
-            if len(failures) > 3:
-                fail_names += f" (+{len(failures) - 3} more)"
-            summary += f" Failed/skipped: {fail_names}."
-        ui.notify(
-            summary, type="positive" if n_fail == 0 else "warning"
+    confirmed = await dialog
+    if not confirmed:
+        return
+
+    def _build(scan: ScanEntry):
+        # Save only — never estimate. Skip scans that haven't been run yet.
+        if scan not in state.activity_cache:
+            return (
+                "not estimated yet — run Estimate first (Save does not "
+                "re-estimate)"
+            )
+        result = state.activity_cache.get(scan)
+        # Colocated: write next to the source scan.
+        out_path = scan.path.parent / f"{scan.path.stem}{postfix}{ext}"
+
+        def _save_only(result=result, out_path=out_path):
+            try:
+                _save_raw(result, out_path)
+            except Exception as exc:  # noqa: BLE001 — disk/format failure
+                raise RuntimeError(
+                    f"could not write {out_path.name} "
+                    f"({type(exc).__name__}: {exc})"
+                ) from exc
+            return out_path
+
+        return (_save_only, (), {})
+
+    client = capture_client()
+
+    async def _bulk() -> None:
+        with client_scope(client):
+            bulk_result = await run_bulk_in_background(
+                state, scans, _build, label="save_activity",
+            )
+        if bulk_result is None:
+            return
+        successes, failures = bulk_result
+        n_ok, n_fail = len(successes), len(failures)
+        summary = (
+            f"Saved {n_ok}/{n_ok + n_fail} deconvolved scan(s) next to their "
+            "source files."
+        )
+        if failures:
+            summary += f" Failed/skipped: {summarize_failures(failures)}"
+        notify_if_alive(
+            client, summary,
+            type="positive" if n_fail == 0 else "warning",
+            multi_line=True,
+            close_button=True,
         )
 
     background_tasks.create(_bulk())
@@ -510,44 +1096,47 @@ def _run(
     if scan not in state.processed_cache:
         state.last_error = "Preprocess the scan first."
         return
+    if scan.path.resolve() not in state.processed_deconvolved:
+        state.last_error = (
+            "Neural-activity estimation requires deconvolution-mode "
+            "preprocessing — re-preprocess this scan with deconvolution."
+        )
+        return
 
     if opts.hrf_model == MODEL_TOEPLITZ:
-        if state.montage is None:
-            state.last_error = "Estimate HRFs (toeplitz mode) first."
-            return
-        if isinstance(state.montage, _CanonicalResult):
+        # Use this scan's own estimated HRFs (per-scan cache), so it works
+        # whether the scan was estimated singly or as part of a bulk run.
+        if _montage_for_scan(state, scan) is None:
             state.last_error = (
-                "Toeplitz activity needs real estimated HRFs; the HRFs tab "
-                "last produced a canonical reference. Re-run HRFs in "
-                "toeplitz mode."
+                "No estimated HRFs for this scan. Estimate HRFs for it on the "
+                "HRFs tab (toeplitz mode), or switch the source to canonical."
             )
             return
-        if (
-            state.montage_source_scan is None
-            or state.montage_source_scan.path != scan.path
-        ):
+    elif opts.hrf_model == MODEL_LIBRARY:
+        if _library_kernel_from_state(state) is None:
             state.last_error = (
-                "The HRFs in memory were estimated for a different scan. "
-                "Re-run the HRFs tab on this scan in toeplitz mode first."
+                "Select an HRF in the HRtree tab to use as the deconvolution "
+                "kernel first."
             )
             return
 
-    snapshot = ActivityOptions(
-        hrf_model=opts.hrf_model,
-        lmbda=opts.lmbda,
-        preview_channel=opts.preview_channel,
-    )
+    snapshot = _snapshot_options(state, opts)
 
     raw = state.processed_cache.get(scan)
     progress_cb = make_progress_callback(state)
     existing_montage = (
-        state.montage if snapshot.hrf_model == MODEL_TOEPLITZ else None
+        _montage_for_scan(state, scan)
+        if snapshot.hrf_model == MODEL_TOEPLITZ else None
     )
 
     async def _on_done(result) -> None:
         if result is None:
             return
         state.activity_raw = result
+        # Cache per scan so channel-wise 3-stage QC can read this scan's
+        # deconvolution later (activity_raw only holds the most-recent one).
+        state.activity_cache._cache[scan.path.resolve()] = result
+        # Track which scan produced activity_raw (preview gate uses it).
         state.activity_source_scan = scan
         state.publish("activity_estimated", scan)
 
@@ -586,8 +1175,10 @@ def run_activity_sync(
     611) does not corrupt ``state.montage`` for the HRFs tab. The
     returned Raw still reflects whichever channels survived deconvolution.
 
-    For canonical mode, ``existing_montage`` is ignored and a fresh Montage
-    is configured to the scan.
+    For canonical and library modes, ``existing_montage`` is ignored and a
+    fresh Montage is configured to the scan. Library mode deconvolves every
+    channel with ``opts.library_trace`` (an HRtree selection), oriented by
+    ``opts.library_oxygenation``.
 
     Module-level so tests can call it without dispatching through workers.
     """
@@ -596,7 +1187,8 @@ def run_activity_sync(
     work_raw = raw.copy()
 
     snapshot = None
-    if opts.hrf_model == MODEL_CANONICAL or existing_montage is None:
+    fresh_montage_models = (MODEL_CANONICAL, MODEL_LIBRARY)
+    if opts.hrf_model in fresh_montage_models or existing_montage is None:
         m = Montage(nirx_obj=work_raw)
     else:
         m = existing_montage
@@ -610,6 +1202,14 @@ def run_activity_sync(
             "hbr_channels": list(getattr(m, "hbr_channels", [])),
         }
 
+    estimate_kwargs = {
+        "timeout": opts.timeout,
+        "drop_failed_channels": opts.drop_failed_channels,
+    }
+    if opts.hrf_model == MODEL_LIBRARY:
+        estimate_kwargs["library_trace"] = opts.library_trace
+        estimate_kwargs["library_oxygenation"] = opts.library_oxygenation
+
     try:
         result = m.estimate_activity(
             work_raw,
@@ -617,6 +1217,7 @@ def run_activity_sync(
             hrf_model=opts.hrf_model,
             preprocess=False,
             progress_callback=progress_callback,
+            **estimate_kwargs,
         )
     finally:
         if snapshot is not None:
