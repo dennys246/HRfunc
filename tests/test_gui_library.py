@@ -1251,7 +1251,6 @@ async def test_cluster_subtab_owns_radius_and_clear_roi(user: User):
     # pre-refactor "Clear ROI" / "Delete active ROI".
     await user.should_see("Clear")
     await user.should_see("Centre (MNI mm)")
-    await user.should_see("Sphere r=")
 
 
 async def test_viz_pane_refreshes_on_selection_change(user: User):
@@ -1423,7 +1422,7 @@ async def test_cluster_subtab_does_not_expose_box_shape(user: User):
     global_state.add_roi()
     _mount_hrtree_route()
     await user.open("/_test_hrtree")
-    await user.should_see("Sphere r=")
+    await user.should_see("ROI radius")  # sphere mode renders the radius slider
     await user.should_not_see("Box half-extents")
     # No half-extent inputs in the sub-tab body.
     await user.should_not_see("half-extents (mm)")

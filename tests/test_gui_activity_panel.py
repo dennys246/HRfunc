@@ -403,32 +403,6 @@ class TestStateMontageSourceScan:
         assert s.montage_source_scan is None
 
 
-async def test_panel_toeplitz_rejects_cross_scan_montage(
-    user: User, tmp_path
-):
-    """Toeplitz mode must refuse when only ANOTHER scan's HRFs exist —
-    applying scan A's HRFs to scan B's Raw would silently produce wrong
-    results. With per-scan montage caching, selecting scan B (whose HRFs
-    aren't cached) reports it has no estimated HRFs of its own."""
-    scan_a = ScanEntry(
-        format="snirf", path=tmp_path / "a.snirf", display_name="scan_a"
-    )
-    scan_b = ScanEntry(
-        format="snirf", path=tmp_path / "b.snirf", display_name="scan_b"
-    )
-    raw = _make_fake_raw()
-    global_state.reset()
-    global_state.manifest = Manifest(root=tmp_path, scans=(scan_a, scan_b))
-    global_state.selected_scan = scan_b
-    global_state.processed_cache._cache[scan_b.path.resolve()] = raw
-    # A real montage tagged to scan A only (not in scan B's cache).
-    global_state.montage = object()  # Stand-in for a real Montage
-    global_state.montage_source_scan = scan_a
-
-    await user.open("/")
-    await user.should_see("No estimated HRFs for this scan")
-
-
 # ---------------------------------------------------------------------------
 # Panel rendering — User fixture
 # ---------------------------------------------------------------------------
@@ -472,32 +446,11 @@ async def test_panel_toeplitz_needs_hrfs_first(user: User, tmp_path):
     global_state.manifest = Manifest(root=tmp_path, scans=(scan,))
     global_state.selected_scan = scan
     global_state.processed_cache._cache[scan.path.resolve()] = raw
-    # No montage set → toeplitz mode should prompt for HRFs first, and offer
-    # a jump to the HRFs tab so the user can accomplish it.
+    # No GROUP montage (≥2 subjects) → estimated-HRF mode prompts for it and
+    # offers a jump to the HRFs tab. (A scan's own HRFs are not an option.)
     await user.open("/")
-    await user.should_see("Toeplitz mode requires estimated HRFs")
+    await user.should_see("average across ≥2 subjects")
     await user.should_see("Go to HRFs tab")
-
-
-async def test_panel_toeplitz_rejects_canonical_result_montage(
-    user: User, tmp_path
-):
-    """If the HRFs tab last produced a canonical reference (not a real
-    Montage with traces), toeplitz Activity mode tells the user to re-run
-    HRFs in toeplitz mode."""
-    scan = ScanEntry(
-        format="snirf", path=tmp_path / "a.snirf", display_name="a"
-    )
-    raw = _make_fake_raw()
-    global_state.reset()
-    global_state.manifest = Manifest(root=tmp_path, scans=(scan,))
-    global_state.selected_scan = scan
-    global_state.processed_cache._cache[scan.path.resolve()] = raw
-    global_state.montage = hrf_panel._CanonicalResult(
-        canonical_trace=np.zeros(10), duration=30.0, sfreq=10.0
-    )
-    await user.open("/")
-    await user.should_see("Toeplitz mode requires real per-channel HRFs")
 
 
 async def test_panel_shows_lambda_control(user: User, tmp_path):
@@ -533,7 +486,8 @@ async def test_workspace_subscribes_activity_panel(user: User, tmp_path):
 
 
 class TestMontageForScan:
-    """Per-scan montage resolution backing toeplitz activity."""
+    """Estimated-HRF (toeplitz) activity uses the GROUP montage only — a
+    scan's own single-subject HRFs are intentionally NOT offered."""
 
     def _scan(self, p):
         return ScanEntry(format="snirf", path=Path(p), display_name=Path(p).stem)
@@ -542,26 +496,20 @@ class TestMontageForScan:
         st = AppState()
         assert activity_panel._montage_for_scan(st, self._scan("/tmp/x.snirf")) is None
 
-    def test_uses_cached_montage(self):
+    def test_none_with_single_subject_cached(self):
+        # One estimated scan is not a group -> own-HRF deconvolution unavailable.
         st = AppState()
-        scan = self._scan("/tmp/x.snirf")
-        m = object()
-        st.montage_cache[scan.path.resolve()] = m
-        assert activity_panel._montage_for_scan(st, scan) is m
+        st.project_montage = object()
+        st.montage_cache[Path("/tmp/a.snirf")] = object()
+        assert activity_panel._montage_for_scan(st, self._scan("/tmp/a.snirf")) is None
 
-    def test_falls_back_to_single_montage_when_source_matches(self):
+    def test_returns_group_with_two_subjects(self):
         st = AppState()
-        scan = self._scan("/tmp/x.snirf")
-        m = object()
-        st.montage = m
-        st.montage_source_scan = scan
-        assert activity_panel._montage_for_scan(st, scan) is m
-
-    def test_ignores_single_montage_for_other_scan(self):
-        st = AppState()
-        st.montage = object()
-        st.montage_source_scan = self._scan("/tmp/a.snirf")
-        assert activity_panel._montage_for_scan(st, self._scan("/tmp/b.snirf")) is None
+        group = object()
+        st.project_montage = group
+        st.montage_cache[Path("/tmp/a.snirf")] = object()
+        st.montage_cache[Path("/tmp/b.snirf")] = object()
+        assert activity_panel._montage_for_scan(st, self._scan("/tmp/x.snirf")) is group
 
     def test_montage_cache_cleared_on_reset(self):
         st = AppState()

@@ -495,6 +495,10 @@ def render_submission_panel(state, *, default_path: Optional[Path] = None) -> No
             "are reviewed before they appear in the HRtree library. "
             "You'll receive a confirmation email at the address below."
         ).classes("text-xs opacity-70")
+        ui.label(
+            "All fields are required. For an experimental context or area "
+            "code that doesn't apply to your study, enter N/A."
+        ).classes("text-xs opacity-60 italic")
 
         # --- HRServ health pill ---------------------------------------
         # Mirrors the hrfunc-web JS pill at the top of /hrf_upload.
@@ -817,9 +821,15 @@ def _text_input(
     def _on_change(event) -> None:
         setattr(metadata, attr, str(event.value or ""))
 
+    # Every field is required, but experimental-context fields and the area
+    # codes may genuinely not apply to a study — so they accept an explicit
+    # "N/A". Surface that as a placeholder so users fill it deliberately
+    # instead of being stuck on a required field that doesn't apply.
+    na_ok = attr in EXPERIMENTAL_CONTEXT_ANCHORS or attr == "area_codes"
     ui.input(
         label=label_text,
         value=getattr(metadata, attr),
+        placeholder="value, or N/A if not applicable" if na_ok else None,
         on_change=_on_change,
     ).props("dense outlined").classes("w-full")
 

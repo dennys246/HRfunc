@@ -865,11 +865,11 @@ def _render_cluster_subtab(state: AppState) -> None:
             # Add ROI / Add Montage buttons), so there's no standalone
             # button here anymore.
 
-            # --- MNI + atlas readouts --------------------------------
+            # --- Atlas readout ---------------------------------------
+            # (The shape/MNI coords readout was removed — it just repeated the
+            # centre inputs + radius slider above. The atlas Region-at-centre
+            # stays as real, non-redundant provenance.)
             ui.separator()
-            ui.label(_format_shape_readout(state)).classes(
-                "text-xs font-mono opacity-80 break-all"
-            )
             if atlas is not None:
                 # Atlas readout is shown in BOTH modes so sphere users
                 # can see "my centre sits in: Frontal Pole" without
@@ -921,9 +921,11 @@ def _render_cluster_subtab(state: AppState) -> None:
                 alignment_affine=alignment,
             )
             roi_result = compute_roi_average(matched, roi_keys)
-            excluded_count = compute_roi_excluded_count(matched, roi_keys)
             can_save = roi_result is not None
 
+            # The "averaging N subjects across M channels" readout moved to the
+            # detail pane (right). Only the can't-save gate stays here so a
+            # disabled Save button still explains itself.
             if roi_result is None:
                 ui.label(
                     "Active ROI has fewer than 2 averageable subject "
@@ -932,19 +934,6 @@ def _render_cluster_subtab(state: AppState) -> None:
                     "centre. (Note: HRFs without per-subject estimates "
                     "are excluded.)"
                 ).classes("text-xs opacity-60 italic")
-            else:
-                _, _, n_subjects, n_channels = roi_result
-                ui.label(
-                    f"Active ROI: averaging {n_subjects} subject "
-                    f"estimates across {n_channels} channel"
-                    f"{'s' if n_channels != 1 else ''}."
-                ).classes("text-xs opacity-70")
-                if excluded_count > 0:
-                    ui.label(
-                        f"  ({excluded_count} HRF"
-                        f"{'s' if excluded_count != 1 else ''} excluded "
-                        f"for lacking subject-level estimates.)"
-                    ).classes("text-xs opacity-50 italic")
 
             # Visibility summary for the multi-ROI case so the user
             # knows the save button reflects fewer than the list shows.
@@ -2193,9 +2182,9 @@ def _render_detail_pane(state: AppState) -> None:
 
             if trace:
                 ui.separator()
-                ui.label("Trace").classes(
-                    "text-xs uppercase opacity-60 tracking-wide"
-                )
+                ui.label(
+                    f"Trace · {'HbO' if hrf.get('oxygenation') else 'HbR'}"
+                ).classes("text-xs uppercase opacity-60 tracking-wide")
                 png = _render_trace_png(hrf)
                 if png is not None:
                     # shrink-0 so the plot keeps its natural size regardless
@@ -2239,14 +2228,57 @@ def _showing_active_roi(state: AppState) -> bool:
     return sel is None or sel is active.anchor
 
 
+def _roi_average_oxygenations(state: AppState) -> "list":
+    """Oxygenations to render ROI averages for — NEVER a mixed pool.
+
+    Averaging HbO and HbR traces together is scientifically wrong (they are
+    inverse responses, so the pool cancels into a meaningless trace). So:
+    - a determinate oxygenation (the clicked anchor's, or the HbO/HbR filter)
+      → that single value;
+    - indeterminate ("Both" with no anchor) → BOTH, rendered as separate,
+      labelled HbO and HbR averages rather than one pooled trace.
+    """
+    oxy = _resolve_cluster_oxygenation(state)
+    if oxy is not None:
+        return [bool(oxy)]
+    return [True, False]
+
+
+def _render_one_roi_average(
+    state: AppState, matched, shape, alignment, oxy: bool, *, header: str
+) -> bool:
+    """Render a single oxygenation-pure ROI average, labelled HbO/HbR.
+
+    Returns True when something rendered (the ROI had ≥2 averageable
+    same-oxygenation members), False otherwise.
+    """
+    roi_keys = compute_roi_keys_by_shape(
+        matched, shape, state.library_roi_painted,
+        oxygenation_filter=oxy,
+        alignment_affine=alignment,
+    )
+    result = compute_roi_average(matched, roi_keys)
+    if result is None:
+        return False
+    mean, std, n_subjects, n_channels = result
+    sfreq = _resolve_roi_sfreq(state.library_selected_hrf, matched, roi_keys)
+    tag = "HbO" if oxy else "HbR"
+    ui.label(
+        f"{header} · {tag} ({n_subjects} subjects, {n_channels} channels)"
+    ).classes("text-xs uppercase opacity-60 tracking-wide")
+    png = _render_roi_average_png(mean, std, sfreq, n_subjects)
+    if png is not None:
+        ui.image(png).classes("max-w-md shrink-0")
+    return True
+
+
 def _render_active_roi_detail(state: AppState) -> bool:
-    """Render the active ROI's aggregate HRF as the primary detail.
+    """Render the active ROI's aggregate HRF(s) as the primary detail.
 
     Returns True when it rendered (the ROI has an averageable HRF), False when
     there's nothing to show — the caller then falls back to the single-HRF
-    detail. Mirrors :func:`_render_roi_average`'s membership computation but
-    leads with ROI-level metadata (name, member/pool counts) instead of a
-    single optode's location/context.
+    detail. Renders one labelled average PER oxygenation so HbO and HbR are
+    never pooled together.
     """
     active = state.active_roi
     if active is None:
@@ -2257,56 +2289,31 @@ def _render_active_roi_detail(state: AppState) -> bool:
         state.library_oxygenation,
     )
     shape = _build_current_shape(state)
-    oxy_filter = _resolve_cluster_oxygenation(state)
     alignment = _alignment_for_shape(state, shape)
-    roi_keys = compute_roi_keys_by_shape(
-        matched, shape, state.library_roi_painted,
-        oxygenation_filter=oxy_filter,
-        alignment_affine=alignment,
-    )
-    result = compute_roi_average(matched, roi_keys)
-    if result is None:
-        return False
-    mean, std, n_subjects, n_channels = result
-    anchor = state.library_selected_hrf
-    sfreq = _resolve_roi_sfreq(anchor, matched, roi_keys)
+    oxygenations = _roi_average_oxygenations(state)
 
     name = getattr(active, "name", None) or "ROI"
-    ui.label(name).classes("text-lg font-mono break-all")
-    if oxy_filter is True:
-        oxy_text = "HbO"
-    elif oxy_filter is False:
-        oxy_text = "HbR"
-    else:
-        oxy_text = "HbO + HbR"
-    _kv("oxygenation", oxy_text)
-    _kv("members", f"{len(roi_keys)} HRF{'s' if len(roi_keys) != 1 else ''}")
-    _kv("pooled", f"{n_subjects} subjects · {n_channels} channels")
-    if isinstance(anchor, dict) and anchor.get("_key"):
-        _kv("anchored on", anchor["_key"])
-
-    ui.separator()
-    ui.label("ROI HRF (averaged trace)").classes(
-        "text-xs uppercase opacity-60 tracking-wide"
-    )
-    png = _render_roi_average_png(mean, std, sfreq, n_subjects)
-    if png is not None:
-        ui.image(png).classes("max-w-md shrink-0")
-    return True
+    rendered = False
+    for oxy in oxygenations:
+        if not rendered:
+            ui.label(name).classes("text-lg font-mono break-all")
+            ui.separator()
+            ui.label("ROI HRF (averaged trace)").classes(
+                "text-xs uppercase opacity-60 tracking-wide"
+            )
+        rendered |= _render_one_roi_average(
+            state, matched, shape, alignment, oxy, header="ROI HRF",
+        )
+    return rendered
 
 
 def _render_roi_average(state: AppState) -> None:
-    """Render the averaged-trace plot for the current ROI.
+    """Render the averaged-trace plot(s) for the current ROI.
 
-    Read-only display: shows the averaged trace PNG with the ROI
-    member count. The Save-to-workspace action lives in the Cluster
-    sub-tab on the left (Phase 6); the detail pane is for viewing,
-    not for committing state to disk.
-
-    Uses the Cluster sub-tab's current Shape (box or sphere) plus
-    the visible-filter context to compute ROI membership, so this
-    panel stays in sync with the cluster shape even when the user
-    has no anchor HRF clicked.
+    Read-only display below the single-HRF detail. Renders one labelled
+    average per oxygenation (HbO and HbR are never pooled together — see
+    :func:`_roi_average_oxygenations`), staying in sync with the Cluster
+    sub-tab's current shape + filters.
     """
     all_hrfs = gather_library_hrfs(state)
     matched = filter_by_oxygenation(
@@ -2314,29 +2321,21 @@ def _render_roi_average(state: AppState) -> None:
         state.library_oxygenation,
     )
     shape = _build_current_shape(state)
-    oxy_filter = _resolve_cluster_oxygenation(state)
     alignment = _alignment_for_shape(state, shape)
-    roi_keys = compute_roi_keys_by_shape(
-        matched, shape, state.library_roi_painted,
-        oxygenation_filter=oxy_filter,
-        alignment_affine=alignment,
-    )
-    result = compute_roi_average(matched, roi_keys)
-    if result is None:
-        return
-    mean, std, n_subjects, n_channels = result
-    # Sfreq: prefer the anchor's when present (legacy behaviour);
-    # otherwise default to the first ROI member's sfreq, falling back
-    # to 1.0 if even that's missing. The save flow does the same.
-    anchor = state.library_selected_hrf
-    sfreq = _resolve_roi_sfreq(anchor, matched, roi_keys)
-    ui.separator()
-    ui.label(
-        f"ROI average ({n_subjects} subjects, {n_channels} channels)"
-    ).classes("text-xs uppercase opacity-60 tracking-wide")
-    png = _render_roi_average_png(mean, std, sfreq, n_subjects)
-    if png is not None:
-        ui.image(png).classes("max-w-md")
+    sep_done = False
+    for oxy in _roi_average_oxygenations(state):
+        roi_keys = compute_roi_keys_by_shape(
+            matched, shape, state.library_roi_painted,
+            oxygenation_filter=oxy, alignment_affine=alignment,
+        )
+        if compute_roi_average(matched, roi_keys) is None:
+            continue
+        if not sep_done:
+            ui.separator()
+            sep_done = True
+        _render_one_roi_average(
+            state, matched, shape, alignment, oxy, header="ROI average",
+        )
 
 
 def _render_roi_average_png(

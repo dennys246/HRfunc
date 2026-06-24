@@ -308,11 +308,6 @@ class AppState:
     # group montage is rebuilt; kept separate from ``montage_cache`` so the
     # per-scan HRFs stay available for single-scan / Activity use.
     project_group_excluded: Set[Path] = field(default_factory=set)
-    # When True, the Activity tab's toeplitz source deconvolves EVERY scan with
-    # the pooled ``project_montage`` (group HRFs, matched by channel name)
-    # instead of each scan's own estimated HRFs. Lets a user apply a group HRF
-    # to scans that weren't individually estimated.
-    activity_use_group_hrfs: bool = False
     # Deconvolved Raw from the most recent estimate_activity call (Sprint 3.4).
     # Typed Any for the same import-graph reason. The Activity panel reads
     # the data + annotations for the lens-style preproc/deconv overlay plot.
@@ -848,7 +843,6 @@ class AppState:
         self.project_montage = None
         self.hrf_preview_group = True
         self.project_group_excluded.clear()
-        self.activity_use_group_hrfs = False
         self.preload_path = None
         self.busy = False
         self.estimation_progress = None
