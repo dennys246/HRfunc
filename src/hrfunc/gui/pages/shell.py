@@ -156,6 +156,13 @@ def _render(state: AppState) -> None:
     ui.query(".nicegui-content").classes(
         "h-screen w-screen overflow-hidden"
     ).style("padding: 0; gap: 0;")
+    # Let the Activity tab's label wrap to two centered lines ("Neural" /
+    # "Activity"). Quasar's q-tab__label is white-space:nowrap by default, so
+    # the embedded newline needs pre-line to take effect.
+    ui.add_head_html(
+        "<style>.hrf-twoline-tab .q-tab__label{white-space:pre-line;"
+        "line-height:1.05;text-align:center}</style>"
+    )
 
     initial_tab = TAB_HRTREE
     if state.preload_path is not None:
@@ -226,7 +233,15 @@ def _render_toolbar(state: AppState, tabs_holder: dict) -> None:
         # proper noun some users will see for the first time)
         with ui.tabs().classes("flex-1") as tabs:
             for name in TAB_NAMES:
-                tab = ui.tab(name)
+                # Keep the internal tab NAME stable (panel routing keys off it),
+                # but give Activity a more explanatory two-line "Neural Activity"
+                # LABEL.
+                if name == TAB_ACTIVITY:
+                    tab = ui.tab(name, label="Neural\nActivity").classes(
+                        "hrf-twoline-tab"
+                    )
+                else:
+                    tab = ui.tab(name)
                 tooltip_text = TAB_TOOLTIPS.get(name, "")
                 if tooltip_text:
                     tab.tooltip(tooltip_text)
