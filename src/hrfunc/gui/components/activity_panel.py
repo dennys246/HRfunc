@@ -1297,20 +1297,45 @@ def _run_bulk(
     background_tasks.create(_bulk())
 
 
+def _resolve_save_targets(scans, folder, postfix, ext) -> "dict":
+    """Output path per scan for a mass activity save (pure / testable).
+
+    ``folder=None`` → colocated next to each source file. A folder → flat
+    destination, with name-collision disambiguation (``_2``, ``_3``, …) so two
+    sources sharing a stem don't clobber each other in the same folder.
+    """
+    out: dict = {}
+    seen: set = set()
+    for s in scans:
+        base = folder if folder is not None else s.path.parent
+        stem = f"{s.path.stem}{postfix}"
+        path = base / f"{stem}{ext}"
+        if folder is not None:
+            i = 2
+            while path.resolve() in seen:
+                path = base / f"{stem}_{i}{ext}"
+                i += 1
+        seen.add(path.resolve())
+        out[s] = path
+    return out
+
+
 async def _mass_save_activity(
     state: AppState,
     scans: List[ScanEntry],
     naming: dict,
 ) -> None:
-    """Save the ALREADY-estimated activity for each scan, colocated with its
-    source file.
+    """Save the ALREADY-estimated activity for each scan.
 
-    For a batch there's no file dialog: each deconvolved scan is written into
-    the SAME folder as its source as ``<stem><postfix><ext>``, after a single
-    confirmation showing the filename format and how many scans will be saved.
-    Save is independent of Estimate — it writes each scan's cached
-    deconvolution (``state.activity_cache``) and never re-estimates; scans
-    with no cached result are skipped with a clear "not estimated yet" reason.
+    A single confirmation dialog shows the filename format and lets the user
+    pick the destination: colocated next to each source file (default,
+    ``<stem><postfix><ext>``) or a single chosen folder — the latter so a
+    READ-ONLY source directory doesn't dead-end the save. In a flat folder,
+    colliding output names are disambiguated (``_2``, ``_3``, …). Save is
+    independent of Estimate — it writes each scan's cached deconvolution
+    (``state.activity_cache``) and never re-estimates; scans with no cached
+    result are skipped with a clear "not estimated yet" reason, and a scan
+    whose target would overwrite its own source file is skipped too.
     Continue-on-error with a final summary toast.
     """
     if state.busy:
@@ -1320,35 +1345,44 @@ async def _mass_save_activity(
     postfix = naming.get("postfix", "_deconvolved")
     ext = naming.get("ext", ".snirf")
     n = len(scans)
-    example = f"{scans[0].path.stem}{postfix}{ext}" if scans else f"<scan>{postfix}{ext}"
 
-    # Pre-flight the colocated targets so the confirmation can warn about
-    # silent clobbering: existing outputs (overwrite) and the dangerous case
-    # where an empty postfix + matching extension would write OVER the source
-    # scan itself. The latter is skipped outright in _build below.
-    def _target(s: ScanEntry):
-        return s.path.parent / f"{s.path.stem}{postfix}{ext}"
+    # Destination: None = colocated (next to each source file); a Path = a
+    # single chosen folder (flat). The chosen-folder option lets the user save
+    # off a READ-ONLY source directory (e.g. a shared/mounted dataset) instead
+    # of being stuck when every colocated write fails.
+    dest: dict = {"folder": None}
 
-    clobber_source = [
-        s for s in scans if _target(s).resolve() == s.path.resolve()
-    ]
-    existing = [
-        s for s in scans
-        if s not in clobber_source and _target(s).exists()
-    ]
+    def _resolve_outputs() -> "dict":
+        return _resolve_save_targets(scans, dest["folder"], postfix, ext)
 
-    # Confirm rather than open a file dialog: each scan saves next to its
-    # source (colocated), so there's no destination to pick.
-    with ui.dialog() as dialog, ui.card().classes("gap-2"):
-        ui.label("Save deconvolved scans").classes("text-base font-semibold")
-        ui.label(
-            f"{n} deconvolved scan{'s' if n != 1 else ''} will be saved next "
-            "to each source file (same folder)."
-        ).classes("text-sm")
+    @ui.refreshable
+    def _dest_section() -> None:
+        outputs = _resolve_outputs()
+        colocated = dest["folder"] is None
+        # Source-clobber only happens colocated (empty postfix + same ext).
+        clobber_source = [
+            s for s in scans if outputs[s].resolve() == s.path.resolve()
+        ]
+        existing = [
+            s for s in scans
+            if s not in clobber_source and outputs[s].exists()
+        ]
+        if colocated:
+            ui.label(
+                f"{n} deconvolved scan{'s' if n != 1 else ''} will be saved "
+                "next to each source file (same folder)."
+            ).classes("text-sm")
+        else:
+            ui.label(
+                f"{n} deconvolved scan{'s' if n != 1 else ''} will be saved "
+                "to this folder:"
+            ).classes("text-sm")
+            ui.label(str(dest["folder"])).classes(
+                "text-xs font-mono opacity-70 break-all"
+            )
         ui.label(f"Filename format:  <scan>{postfix}{ext}").classes(
             "text-xs font-mono opacity-70"
         )
-        ui.label(f"e.g.  {example}").classes("text-xs font-mono opacity-50")
         if existing:
             ui.label(
                 f"⚠ {len(existing)} file(s) already exist and will be "
@@ -1358,8 +1392,34 @@ async def _mass_save_activity(
             ui.label(
                 f"⚠ {len(clobber_source)} would write over the SOURCE scan "
                 "(empty postfix + same format) — these will be SKIPPED. Set a "
-                "filename postfix to save them."
+                "filename postfix, or choose a different folder."
             ).classes("text-xs text-red-700")
+
+    async def _choose_folder() -> None:
+        from .dataset_picker import pick_folder
+
+        picked = await pick_folder()
+        if picked is not None:
+            dest["folder"] = picked
+            _dest_section.refresh()
+
+    def _use_colocated() -> None:
+        dest["folder"] = None
+        _dest_section.refresh()
+
+    with ui.dialog() as dialog, ui.card().classes("gap-2 w-[540px] max-w-full"):
+        ui.label("Save deconvolved scans").classes("text-base font-semibold")
+        _dest_section()
+        with ui.row().classes("items-center gap-2"):
+            ui.button(
+                "Choose folder…", icon="folder_open", on_click=_choose_folder,
+            ).props("flat dense").tooltip(
+                "Save the whole batch into one folder — use this when the "
+                "source folder is read-only."
+            )
+            ui.button(
+                "Next to each source", icon="restore", on_click=_use_colocated,
+            ).props("flat dense")
         with ui.row().classes("justify-end gap-2 w-full"):
             ui.button("Cancel", on_click=lambda: dialog.submit(False)).props("flat")
             ui.button("Save", icon="save", on_click=lambda: dialog.submit(True)).props(
@@ -1369,6 +1429,9 @@ async def _mass_save_activity(
     if not confirmed:
         return
 
+    # Freeze the destination mapping at confirm time.
+    outputs = _resolve_outputs()
+
     def _build(scan: ScanEntry):
         # Save only — never estimate. Skip scans that haven't been run yet.
         if scan not in state.activity_cache:
@@ -1377,8 +1440,7 @@ async def _mass_save_activity(
                 "re-estimate)"
             )
         result = state.activity_cache.get(scan)
-        # Colocated: write next to the source scan.
-        out_path = scan.path.parent / f"{scan.path.stem}{postfix}{ext}"
+        out_path = outputs[scan]
         # Never overwrite the SOURCE file (empty postfix + same extension) —
         # that would destroy the raw recording. Skip with a clear reason.
         if out_path.resolve() == scan.path.resolve():
@@ -1389,6 +1451,7 @@ async def _mass_save_activity(
 
         def _save_only(result=result, out_path=out_path):
             try:
+                out_path.parent.mkdir(parents=True, exist_ok=True)
                 _save_raw(result, out_path)
             except Exception as exc:  # noqa: BLE001 — disk/format failure
                 raise RuntimeError(
@@ -1410,9 +1473,12 @@ async def _mass_save_activity(
             return
         successes, failures = bulk_result
         n_ok, n_fail = len(successes), len(failures)
+        where = (
+            f"to {dest['folder']}" if dest["folder"] is not None
+            else "next to their source files"
+        )
         summary = (
-            f"Saved {n_ok}/{n_ok + n_fail} deconvolved scan(s) next to their "
-            "source files."
+            f"Saved {n_ok}/{n_ok + n_fail} deconvolved scan(s) {where}."
         )
         if failures:
             summary += f" Failed/skipped: {summarize_failures(failures)}"

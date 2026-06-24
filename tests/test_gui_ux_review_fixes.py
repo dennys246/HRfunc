@@ -209,3 +209,51 @@ class TestBulkCancel:
         assert len(ran) == 3
         assert len(successes) == 3
         assert failures == []
+
+
+# ---------------------------------------------------------------------------
+# 13b. Mass-save destination resolution (colocated / chosen folder / collisions)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveSaveTargets:
+    def test_colocated_writes_next_to_each_source(self, tmp_path):
+        a = _scan(tmp_path / "sub-01" / "a.snirf")
+        b = _scan(tmp_path / "sub-02" / "b.snirf")
+        out = activity_panel._resolve_save_targets(
+            [a, b], None, "_deconvolved", ".snirf"
+        )
+        assert out[a] == tmp_path / "sub-01" / "a_deconvolved.snirf"
+        assert out[b] == tmp_path / "sub-02" / "b_deconvolved.snirf"
+
+    def test_chosen_folder_is_flat(self, tmp_path):
+        dest = tmp_path / "out"
+        a = _scan(tmp_path / "sub-01" / "a.snirf")
+        b = _scan(tmp_path / "sub-02" / "b.snirf")
+        out = activity_panel._resolve_save_targets(
+            [a, b], dest, "_deconvolved", ".snirf"
+        )
+        assert out[a] == dest / "a_deconvolved.snirf"
+        assert out[b] == dest / "b_deconvolved.snirf"
+
+    def test_flat_folder_disambiguates_colliding_stems(self, tmp_path):
+        dest = tmp_path / "out"
+        # Two different sources with the SAME stem would collide in one folder.
+        a = _scan(tmp_path / "s1" / "scan.snirf")
+        b = _scan(tmp_path / "s2" / "scan.snirf")
+        out = activity_panel._resolve_save_targets(
+            [a, b], dest, "_deconvolved", ".snirf"
+        )
+        assert out[a] == dest / "scan_deconvolved.snirf"
+        assert out[b] == dest / "scan_deconvolved_2.snirf"  # disambiguated
+        assert out[a] != out[b]
+
+    def test_colocated_same_stem_different_folders_no_collision(self, tmp_path):
+        # Colocated keeps them in separate folders, so no disambiguation needed.
+        a = _scan(tmp_path / "s1" / "scan.snirf")
+        b = _scan(tmp_path / "s2" / "scan.snirf")
+        out = activity_panel._resolve_save_targets(
+            [a, b], None, "_deconvolved", ".snirf"
+        )
+        assert out[a] == tmp_path / "s1" / "scan_deconvolved.snirf"
+        assert out[b] == tmp_path / "s2" / "scan_deconvolved.snirf"
