@@ -196,10 +196,20 @@ def _maybe_automatch_events(
     # Verbose: announce the auto-match (this fires once per scan — the match
     # is memoized — so it isn't spammy). The not-found case is conveyed by
     # the status banner ("scan annotations · none loaded from file").
-    ui.notify(
-        f"Auto-matched events: {found.name} ({_events_summary(parsed)}).",
-        type="positive",
-    )
+    #
+    # The toast is incidental FEEDBACK — the auto-match data work above is the
+    # real behaviour. ``ui.notify`` requires an active UI slot, and this
+    # function can run outside one (a unit test, or any non-render caller),
+    # where it would raise "slot stack ... is empty" and abort the match that
+    # already succeeded. Make the toast best-effort so it can never break the
+    # data flow.
+    try:
+        ui.notify(
+            f"Auto-matched events: {found.name} ({_events_summary(parsed)}).",
+            type="positive",
+        )
+    except RuntimeError:
+        logger.debug("auto-match toast skipped: no active UI slot")
 
 
 def _events_summary(parsed) -> str:

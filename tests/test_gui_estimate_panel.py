@@ -367,6 +367,10 @@ async def test_panel_shows_event_picker_when_preprocessed(user: User, tmp_path):
     global_state.selected_scan = scan
     global_state.processed_cache._cache[scan.path.resolve()] = raw
     global_state.raw_cache._cache[scan.path.resolve()] = raw
+    # The event picker only renders once the scan is preprocessed in
+    # DECONVOLUTION mode (HRF estimation requires it); otherwise the panel
+    # hard-blocks with a "needs deconvolution" prompt. Mark it as such.
+    global_state.processed_deconvolved.add(scan.path.resolve())
 
     await user.open("/")
     # Event names should appear as checkbox labels.
