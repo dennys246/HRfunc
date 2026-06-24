@@ -269,6 +269,8 @@ def _apply_alignment_to_point(
     """
     if alignment_affine is None:
         return point_mm
+    import numpy as np  # local: module-level numpy is TYPE_CHECKING-only
+
     homo = np.array(
         [point_mm[0], point_mm[1], point_mm[2], 1.0], dtype=np.float64
     )
@@ -986,37 +988,60 @@ def _render_cluster_subtab(state: AppState) -> None:
                         if _shape is None:
                             skipped.append((slot.name, "no shape"))
                             continue
-                        _oxy = _resolve_cluster_oxygenation(state)
                         _alignment = _alignment_for_shape(state, _shape)
-                        _roi_keys = compute_roi_keys_by_shape(
-                            _matched, _shape, slot.painted,
-                            oxygenation_filter=_oxy,
-                            alignment_affine=_alignment,
-                        )
-                        _result = compute_roi_average(_matched, _roi_keys)
-                        if _result is None:
+                        from ..workspace_io import build_roi_entry
+
+                        # Oxygenation purity: HbO and HbR are inverse
+                        # responses, so averaging them together cancels and
+                        # is always wrong. Reuse the SAME helper the detail
+                        # pane uses (_roi_average_oxygenations) so the saved
+                        # montage can never diverge from what's displayed: a
+                        # determinate oxygenation saves one entry; an
+                        # indeterminate "both, no anchor" slot fans out into a
+                        # separate, labelled entry per haemoglobin instead of
+                        # persisting one mixed (scientifically wrong) average.
+                        _oxys = _roi_average_oxygenations(state)
+
+                        _slot_saved = 0
+                        for _oxy in _oxys:
+                            _roi_keys = compute_roi_keys_by_shape(
+                                _matched, _shape, slot.painted,
+                                oxygenation_filter=_oxy,
+                                alignment_affine=_alignment,
+                            )
+                            _result = compute_roi_average(_matched, _roi_keys)
+                            if _result is None:
+                                continue
+                            _mean, _std, _n_subjects, _n_channels = _result
+                            _sfreq = _resolve_roi_sfreq(
+                                slot.anchor, _matched, _roi_keys
+                            )
+                            # Tag the name by haemoglobin only when the slot
+                            # fanned out into both, so single-oxygenation
+                            # saves keep the user's exact ROI name.
+                            _entry_name = (
+                                f"{slot.name} ({'HbO' if _oxy else 'HbR'})"
+                                if len(_oxys) > 1 else slot.name
+                            )
+                            entries.append(
+                                build_roi_entry(
+                                    roi_keys=_roi_keys,
+                                    hrf_mean=_mean,
+                                    hrf_std=_std,
+                                    sfreq=_sfreq,
+                                    shape=_shape,
+                                    anchor=slot.anchor,
+                                    library_filter=state.library_filter,
+                                    oxygenation_filter=_oxy,
+                                    name=_entry_name,
+                                )
+                            )
+                            _slot_saved += 1
+                        if _slot_saved == 0:
                             skipped.append(
                                 (slot.name, "insufficient estimates")
                             )
                             continue
-                        _mean, _std, _n_subjects, _n_channels = _result
-                        _sfreq = _resolve_roi_sfreq(
-                            slot.anchor, _matched, _roi_keys
-                        )
-                        from ..workspace_io import build_roi_entry
-                        entries.append(
-                            build_roi_entry(
-                                roi_keys=_roi_keys,
-                                hrf_mean=_mean,
-                                hrf_std=_std,
-                                sfreq=_sfreq,
-                                shape=_shape,
-                                anchor=slot.anchor,
-                                library_filter=state.library_filter,
-                                oxygenation_filter=_oxy,
-                                name=slot.name,
-                            )
-                        )
                 finally:
                     state.cluster_active_index = original_index
                     state.library_selected_hrf = original_anchor
@@ -2294,13 +2319,19 @@ def _render_active_roi_detail(state: AppState) -> bool:
 
     name = getattr(active, "name", None) or "ROI"
     rendered = False
+    # Emit the ROI title/header exactly ONCE, before the first oxygenation
+    # pass. Gating on ``rendered`` (the old behaviour) re-emitted the header
+    # for the second oxygenation whenever the first one rendered nothing,
+    # producing a doubled "ROI HRF" title above a single HbR plot.
+    header_shown = False
     for oxy in oxygenations:
-        if not rendered:
+        if not header_shown:
             ui.label(name).classes("text-lg font-mono break-all")
             ui.separator()
             ui.label("ROI HRF (averaged trace)").classes(
                 "text-xs uppercase opacity-60 tracking-wide"
             )
+            header_shown = True
         rendered |= _render_one_roi_average(
             state, matched, shape, alignment, oxy, header="ROI HRF",
         )

@@ -201,6 +201,16 @@ def parse_events_file(path: Path) -> EventsParse:
         # (one value per timepoint), not onset times. Detect and return it as
         # the "impulse" format so it's applied by sample index rather than
         # misread as onsets-at-t=0/1.
+        #
+        # NOTE: a single all-0/1 column is inherently ambiguous -- it could be
+        # a tiny onset list whose onset TIMES are literally 0 s / 1 s. The
+        # library resolves that ambiguity in favour of "impulse" by design
+        # (per-sample 0/1 design vectors are the common case; the demo
+        # events.txt is one such 1999-sample vector), and the events_io tests
+        # pin this for short vectors too. Onset lists with any value beyond
+        # 0/1 fall through to the onset path below, which is the realistic
+        # disambiguator. Do NOT add a length threshold here without updating
+        # those tests -- it would reclassify legitimate short impulse vectors.
         single_col_vals = [
             r[0].strip() for r in table if r and r[0].strip()
         ]

@@ -54,6 +54,7 @@ import base64
 import io
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import numpy as np
@@ -511,10 +512,23 @@ def _build_project_montage(sourced_montages: list):
         return None
 
     group = copy.deepcopy(real[0][1])
+    # Strip any per-scan 'global_*' aggregate nodes the base carries in.
+    # Each subject montage already ran generate_distribution, which
+    # synthesises global_hbo/global_hbr channels that hold a single estimate
+    # (that subject's own grand mean). If those survive into the pool, the
+    # final generate_distribution sees their non-empty ``estimates`` and
+    # treats them as real channels -- folding a "global of globals" back
+    # into the group mean and deflating the between-subject std. Drop them
+    # and let the final generate_distribution rebuild the globals cleanly
+    # from the real channels only.
+    for ch in [c for c in group.channels if "global" in c]:
+        del group.channels[ch]
     # Union of channels: graft in any channel present in a later subject but
     # absent from the base (heterogeneous montage layouts across subjects).
     for _sid, m in real[1:]:
         for ch, node in getattr(m, "channels", {}).items():
+            if "global" in ch:
+                continue  # globals are rebuilt below, never pooled
             if ch not in group.channels:
                 group.channels[ch] = copy.deepcopy(node)
     # Pool every subject's estimate into each channel, tagged by source.
@@ -1728,6 +1742,8 @@ def _run_bulk(
         selected_events=opts.selected_events,
         timeout=opts.timeout,
         edge_expansion=opts.edge_expansion,
+        edge_std_frac=opts.edge_std_frac,
+        edge_std_ratio=opts.edge_std_ratio,
     )
 
     def _build(scan: ScanEntry):
@@ -1765,6 +1781,8 @@ def _run_bulk(
                     selected_events=selected,
                     timeout=snapshot.timeout,
                     edge_expansion=snapshot.edge_expansion,
+                    edge_std_frac=snapshot.edge_std_frac,
+                    edge_std_ratio=snapshot.edge_std_ratio,
                 )
                 return run_toeplitz_sync(
                     raw, scan_opts, progress_cb, event_rows, event_impulse
@@ -1852,6 +1870,8 @@ def _run(
         selected_events=opts.selected_events,
         timeout=opts.timeout,
         edge_expansion=opts.edge_expansion,
+        edge_std_frac=opts.edge_std_frac,
+        edge_std_ratio=opts.edge_std_ratio,
     )
 
     if snapshot.model == MODEL_TOEPLITZ:

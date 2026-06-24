@@ -766,13 +766,23 @@ def _compute_signal_metrics(raw: "mne.io.BaseRaw") -> QualityMetrics:
 
 
 def _nanmean_or_none(by_channel: Optional[Dict[str, float]]) -> Optional[float]:
-    """Mean of a by-channel dict's values, or None when absent/empty."""
+    """Mean of a by-channel dict's values, or None when absent/empty.
+
+    Drops both ``None`` and ``NaN`` values: a channel can yield a real NaN
+    metric (e.g. a flat/zero-variance channel), and ``np.nanmean`` over a
+    list that is *all* NaN both emits a RuntimeWarning and returns NaN rather
+    than the None this is meant to produce. Filtering NaN first means an
+    all-NaN (or all-None) input cleanly returns None.
+    """
     if not by_channel:
         return None
-    vals = [v for v in by_channel.values() if v is not None]
+    vals = [
+        v for v in by_channel.values()
+        if v is not None and not np.isnan(v)
+    ]
     if not vals:
         return None
-    return float(np.nanmean(vals))
+    return float(np.mean(vals))
 
 
 def _compute_raw_metrics(raw: "mne.io.BaseRaw") -> QualityMetrics:

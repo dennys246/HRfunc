@@ -148,8 +148,11 @@ async def run_in_background(
         )
         return None
 
-    state.set_busy(True)
+    # Clear last_error BEFORE set_busy(True): set_busy synchronously
+    # publishes busy_changed, so a subscriber that re-renders an error banner
+    # would otherwise observe the previous run's error for one frame.
     state.last_error = None
+    state.set_busy(True)
     result: Any = None
     try:
         # Use run_in_executor instead of asyncio.to_thread (3.9+) so the GUI
@@ -274,8 +277,10 @@ async def run_bulk_in_background(
     if not scans:
         return ([], [])
 
-    state.set_busy(True)
+    # Clear last_error before set_busy(True) publishes busy_changed (see the
+    # single-run worker above for the one-frame stale-error rationale).
     state.last_error = None
+    state.set_busy(True)
     successes: List[ScanEntry] = []
     failures: List[Tuple[ScanEntry, str]] = []
     total = len(scans)

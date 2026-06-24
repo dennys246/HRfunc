@@ -1186,8 +1186,11 @@ def _run_bulk(
             )
         state.activity_raw = result
         # Cache per scan so channel-wise 3-stage QC can read each scan's
-        # deconvolution (activity_raw only holds the most-recent one).
-        state.activity_cache._cache[scan.path.resolve()] = result
+        # deconvolution (activity_raw only holds the most-recent one). Route
+        # through ``put`` rather than poking ``_cache`` directly -- the cache
+        # is unbounded (maxsize=None) so nothing is evicted, and going via
+        # the API keeps key normalisation in one place.
+        state.activity_cache.put(scan, result)
         # Track which scan produced activity_raw so the preview won't overlay
         # one scan's deconvolution against another's preprocessed Raw.
         state.activity_source_scan = scan
@@ -1377,7 +1380,9 @@ def _run(
         state.activity_raw = result
         # Cache per scan so channel-wise 3-stage QC can read this scan's
         # deconvolution later (activity_raw only holds the most-recent one).
-        state.activity_cache._cache[scan.path.resolve()] = result
+        # ``put`` on the unbounded (maxsize=None) cache: no eviction, one
+        # place for key normalisation.
+        state.activity_cache.put(scan, result)
         # Track which scan produced activity_raw (preview gate uses it).
         state.activity_source_scan = scan
         state.publish("activity_estimated", scan)
