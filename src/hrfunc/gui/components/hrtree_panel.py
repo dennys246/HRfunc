@@ -2285,13 +2285,17 @@ def _render_one_roi_average(
     result = compute_roi_average(matched, roi_keys)
     if result is None:
         return False
-    mean, std, n_subjects, n_channels = result
+    mean, std, n_estimates, n_channels = result
     sfreq = _resolve_roi_sfreq(state.library_selected_hrf, matched, roi_keys)
     tag = "HbO" if oxy else "HbR"
+    # ``n_estimates`` is the count of pooled subject-level estimate TRACES
+    # across all ROI channels (one subject contributing on K channels adds K
+    # traces) -- it is NOT a distinct-subject count. Label it "estimates" so
+    # the readout doesn't overstate the sample as N subjects.
     ui.label(
-        f"{header} · {tag} ({n_subjects} subjects, {n_channels} channels)"
+        f"{header} · {tag} ({n_estimates} estimates from {n_channels} channels)"
     ).classes("text-xs uppercase opacity-60 tracking-wide")
-    png = _render_roi_average_png(mean, std, sfreq, n_subjects)
+    png = _render_roi_average_png(mean, std, sfreq, n_estimates)
     if png is not None:
         ui.image(png).classes("max-w-md shrink-0")
     return True

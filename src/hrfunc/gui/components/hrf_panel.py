@@ -76,6 +76,7 @@ from ..workers import (
     client_scope,
     make_progress_callback,
     notify_if_alive,
+    render_bulk_cancel_button,
     run_bulk_in_background,
     run_in_background,
     summarize_failures,
@@ -762,6 +763,23 @@ def _render_preview_column(
             _render_toeplitz_gallery(state, state.project_montage)
             return
 
+    # Upstream nudge: estimated-HRF Neural Activity deconvolution needs a
+    # GROUP montage (≥2 subjects). After a single subject, surface that here
+    # so the user isn't blindsided by a disabled Run on the Activity tab.
+    if (
+        n_subjects == 1
+        and state.montage is not None
+        and not isinstance(state.montage, _CanonicalResult)
+    ):
+        with ui.row().classes("items-center gap-2"):
+            ui.icon("groups", size="sm").classes("text-blue-600")
+            ui.label(
+                "1 subject estimated. Estimate HRFs for at least one more "
+                "subject to build the GROUP HRFs that Neural Activity "
+                "deconvolution uses — a single subject has no between-subject "
+                "variability. (Canonical / HRtree sources work with one scan.)"
+            ).classes("text-xs text-blue-800")
+
     preview_scan = scan if not bulk_mode else state.montage_source_scan
     if state.montage is None or preview_scan is None:
         ui.label(
@@ -1057,8 +1075,18 @@ async def _open_events_dialog(
         _results.refresh()
         _preview.refresh()
 
-    def _search() -> None:
-        sel["results"] = find_event_files(root, sel["pattern"]) if root else []
+    async def _search(_e=None) -> None:
+        # find_event_files walks the whole project tree; run it off the event
+        # loop so a large dataset doesn't freeze the UI during the search.
+        if root:
+            import asyncio
+
+            loop = asyncio.get_event_loop()
+            sel["results"] = await loop.run_in_executor(
+                None, find_event_files, root, sel["pattern"]
+            )
+        else:
+            sel["results"] = []
         _results.refresh()
 
     with ui.dialog() as dialog, ui.card().classes("w-[640px] max-w-full gap-2"):
@@ -1073,7 +1101,9 @@ async def _open_events_dialog(
                 placeholder="filter, e.g. events*  or  *.tsv  (blank = all)",
                 on_change=lambda e: sel.__setitem__("pattern", e.value or ""),
             ).props("dense outlined").classes("flex-1").on(
-                "keydown.enter", lambda e: _search()
+                # Pass the coroutine directly — a sync lambda wrapping the
+                # async _search would return an un-awaited coroutine (no-op).
+                "keydown.enter", _search
             )
             ui.button("Search", icon="search", on_click=_search).props("flat dense")
 
@@ -1448,7 +1478,10 @@ def _render_toeplitz_global_params(opts: EstimationOptions) -> None:
     )
 
     def _on_lmbda_change(event) -> None:
-        log_val = int(event.value)
+        try:
+            log_val = int(event.value)
+        except (TypeError, ValueError):
+            return  # ignore a None/NaN slider payload rather than crash
         opts.lmbda = float(10 ** log_val)
         lmbda_display.set_text(f"lambda = {opts.lmbda:.0e}")
 
@@ -1577,6 +1610,15 @@ def _render_canonical_note() -> None:
         "~6 s, undershoot at ~16 s) — a fixed reference shape, not "
         "data-driven. Click Generate to display."
     ).classes("text-sm opacity-70")
+    # Set expectations: canonical results are a reference shape only. They are
+    # NOT cached as subject montages, so they do not build the project GROUP
+    # montage that Neural Activity's "Estimated HRFs" source uses. Switch to
+    # toeplitz mode to contribute a subject.
+    ui.label(
+        "Note: canonical HRFs are a reference shape only — they don't count "
+        "as a subject toward the group montage. Use toeplitz mode to "
+        "estimate data-driven HRFs that build the group."
+    ).classes("text-xs opacity-60 italic")
 
 
 def _render_run_row(
@@ -1683,6 +1725,7 @@ def _render_busy_progress(state: AppState) -> None:
                     f"  Channel {current + 1}/{total_ch}: {name}"
                 ).classes("text-xs opacity-60")
                 ui.linear_progress(value=fraction).classes("w-64")
+            render_bulk_cancel_button(state)
         return
 
     prog = state.estimation_progress
@@ -1923,6 +1966,15 @@ def _run(
 
     async def _on_done(result) -> None:
         if result is None:
+            # Estimation yielded nothing. Surface feedback rather than leaving
+            # the previous scan's montage on screen as if this one succeeded.
+            # Preserve a worker-recorded exception message if present.
+            if not state.last_error:
+                state.last_error = (
+                    "HRF estimation produced no output for this scan — check "
+                    "the events selection and that the scan is "
+                    "deconvolution-preprocessed."
+                )
             return
         state.montage = result
         # Track which scan produced this montage so the Activity tab can

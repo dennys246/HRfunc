@@ -90,6 +90,34 @@ def notify_if_alive(client, message: str, **kwargs) -> None:
     except Exception as exc:  # noqa: BLE001 — client died between check & emit
         logger.debug("notify_if_alive: notify failed: %s", exc)
 
+
+def render_bulk_cancel_button(state) -> None:
+    """Render a Cancel control for an in-flight bulk run.
+
+    Cooperative cancel: sets ``state.cancel_requested`` so
+    :func:`run_bulk_in_background` stops before the next scan (the current
+    scan finishes first). Once requested, shows a "cancelling" note instead of
+    the button. No-op when no bulk run is in flight. Shared across the
+    Preprocess / HRFs / Neural Activity panels' progress displays.
+    """
+    from nicegui import ui
+
+    if state.bulk_progress is None:
+        return
+    if state.cancel_requested:
+        ui.label("Cancelling after this scan…").classes(
+            "text-xs opacity-70 italic"
+        )
+        return
+
+    def _cancel() -> None:
+        state.cancel_requested = True
+
+    ui.button("Cancel run", icon="stop", on_click=_cancel).props(
+        "flat dense color=negative"
+    ).tooltip("Stop the bulk run after the current scan finishes.")
+
+
 from .state import AppState
 from ..io.manifest import ScanEntry
 
@@ -280,6 +308,7 @@ async def run_bulk_in_background(
     # Clear last_error before set_busy(True) publishes busy_changed (see the
     # single-run worker above for the one-frame stale-error rationale).
     state.last_error = None
+    state.cancel_requested = False
     state.set_busy(True)
     successes: List[ScanEntry] = []
     failures: List[Tuple[ScanEntry, str]] = []
@@ -287,6 +316,13 @@ async def run_bulk_in_background(
     loop = asyncio.get_event_loop()
     try:
         for index, scan in enumerate(scans):
+            # Cooperative cancel: stop before starting the next scan (the
+            # current scan, if any, has already completed). Remaining scans
+            # are reported as cancelled so the summary is honest.
+            if state.cancel_requested:
+                for remaining in scans[index:]:
+                    failures.append((remaining, "cancelled by user"))
+                break
             state.bulk_progress = (index, total, scan)
             # Per-scan within-channel progress is reset between scans
             # so the previous scan's last channel number doesn't bleed
@@ -338,6 +374,7 @@ async def run_bulk_in_background(
     finally:
         state.bulk_progress = None
         state.estimation_progress = None
+        state.cancel_requested = False
         state.set_busy(False)
 
     return (successes, failures)

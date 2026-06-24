@@ -119,6 +119,17 @@ def _render_body(state: AppState) -> None:
     with ui.column().classes("p-6 gap-4 w-full"):
         ui.label("Quality").classes("text-2xl font-semibold")
 
+        # The dataset-tree checkboxes drive BULK actions on the Preprocess /
+        # HRFs / Neural Activity tabs only. Quality works on the selected scan
+        # plus the dataset-wide aggregate, so a checked selection has no effect
+        # here -- say so when one exists to avoid silent confusion.
+        if state.checked_scan_paths:
+            ui.label(
+                f"Note: the {len(state.checked_scan_paths)} checked scan(s) "
+                "drive bulk actions on other tabs. Quality reports on the "
+                "selected scan and the whole dataset, not the checked set."
+            ).classes("text-xs opacity-60 italic")
+
         scan = state.selected_scan
         if scan is None and not state.quality_metrics:
             ui.label("Select a scan from the dataset tree.").classes(

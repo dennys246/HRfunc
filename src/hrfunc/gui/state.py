@@ -280,6 +280,11 @@ class AppState:
     # bulk run. ``None`` when no bulk run is in flight. Set by
     # ``workers.run_bulk_in_background`` as it advances.
     bulk_progress: Optional[Tuple[int, int, ScanEntry]] = None
+    # Cooperative cancel flag for an in-flight bulk run. The Cancel button in
+    # the bulk-progress UI sets it; ``run_bulk_in_background`` checks it before
+    # each scan and stops gracefully (the current scan finishes). Reset at the
+    # start and end of every bulk run.
+    cancel_requested: bool = False
     last_error: Optional[str] = None
     subscribers: Dict[str, List[EventCallback]] = field(default_factory=dict)
     # Montage from the most recent HRF estimation (Sprint 3.3). Typed as Any to
@@ -863,6 +868,7 @@ class AppState:
         self.processed_deconvolved.clear()
         self.checked_scan_paths.clear()
         self.bulk_progress = None
+        self.cancel_requested = False
         self.estimation_progress = None
         self.last_error = None
         self.events_rows = None
