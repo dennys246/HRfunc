@@ -1289,6 +1289,35 @@ async def test_viz_pane_refreshes_on_selection_change(user: User):
     assert len(selection_subs) >= 1
 
 
+async def test_rapid_selection_changes_do_not_orphan_viz_timer(
+    user: User, caplog
+):
+    """Regression: clicking through HRFs faster than the 0.05 s deferred viz
+    refresh used to orphan a ``once=True`` timer — an intervening
+    ``_viz_body.refresh()`` deleted the slot the pending timer was parented to,
+    so it fired into a dead slot and raised "parent slot of the element has
+    been deleted". The deferred timer now lives on a stable anchor element
+    (outside the refreshable body) and dedupes, so the churn can't orphan it.
+
+    The deferred refresh fires ``_viz_body.refresh()``; publishing the event in
+    a rapid burst then letting the timers run exercises that path.
+    """
+    import asyncio
+    import logging
+
+    global_state.reset()
+    _silent(library._load_trees, global_state)
+    _mount_hrtree_route()
+    await user.open("/_test_hrtree")
+
+    with caplog.at_level(logging.ERROR):
+        for _ in range(6):
+            global_state.publish("hrtree_selection_changed", [])
+        await asyncio.sleep(0.2)  # let the 0.05 s deferred timer(s) fire
+
+    assert "parent slot" not in caplog.text
+
+
 async def test_cluster_subtab_exposes_atlas_shape_option(user: User):
     """When the bundled Harvard-Oxford atlas loads, the per-row shape
     dropdown lets each ROI pick between Sphere and Atlas region.
