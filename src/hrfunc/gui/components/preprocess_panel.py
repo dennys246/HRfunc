@@ -167,6 +167,109 @@ def ensure_deconvolved_raw(state: AppState, scan):
     return result
 
 
+def scan_is_deconvolved(state: AppState, scan: ScanEntry) -> bool:
+    """True when ``scan`` has a deconvolution-preprocessed Raw cached.
+
+    The same readiness gate HRF / activity estimation use: present in
+    ``processed_cache`` AND recorded in ``processed_deconvolved`` (a
+    GLM/haemoglobin preprocess does not count). Shared so the HRFs and
+    Activity tabs report bulk readiness consistently.
+    """
+    return (
+        scan in state.processed_cache
+        and scan.path.resolve() in state.processed_deconvolved
+    )
+
+
+def preprocess_all_checked(state: AppState, scans: list) -> None:
+    """Deconvolution-preprocess every not-yet-ready scan in ``scans`` as one
+    background batch — the bulk analog of the HRFs tab's single-scan
+    "Preprocess now".
+
+    Reuses ``ensure_deconvolved_raw`` via ``run_bulk_in_background`` so the
+    busy gate, per-scan progress, and continue-on-error semantics match the
+    bulk estimate flows. Already-deconvolved scans are filtered out so the
+    toast counts reflect real work. Shared by the HRFs and Activity tabs.
+    """
+    if state.busy:
+        return
+    targets = [s for s in scans if not scan_is_deconvolved(state, s)]
+    if not targets:
+        ui.notify("All checked scans are already preprocessed.", type="info")
+        return
+
+    def _build(scan: ScanEntry):
+        # ensure_deconvolved_raw loads + deconvolution-preprocesses + caches +
+        # records processed_deconvolved itself, raising with a specific reason
+        # on failure; the worker turns that into a per-scan failure.
+        return (ensure_deconvolved_raw, (state, scan), {})
+
+    async def _on_each(scan: ScanEntry, _result) -> None:
+        state.publish("preprocess_done", scan)
+
+    async def _run() -> None:
+        result = await run_bulk_in_background(
+            state, targets, _build,
+            on_each_done=_on_each, label="bulk preprocess",
+        )
+        if result is None:
+            return
+        successes, failures = result
+        if failures:
+            ui.notify(
+                f"Preprocessed {len(successes)} scan(s); "
+                f"{len(failures)} failed — see the latest error.",
+                type="warning",
+            )
+        else:
+            ui.notify(
+                f"Preprocessed {len(successes)} scan(s).", type="positive"
+            )
+
+    ui.notify("Preprocessing checked scans…", type="info")
+    background_tasks.create(_run())
+
+
+def render_preprocess_all_checked(state: AppState, scans: list) -> None:
+    """Bulk preprocess affordance: readiness summary + one-click run.
+
+    Mirrors the HRFs tab's single-scan "Preprocess now" for the checked set.
+    The bulk estimate already preprocesses each scan on demand, so this is a
+    convenience / pre-warm plus a clear readiness readout — not a
+    prerequisite. Shared by the HRFs and Activity tabs.
+    """
+    if state.busy:
+        with ui.row().classes("items-center gap-2"):
+            ui.spinner(size="sm")
+            ui.label("Preprocessing…").classes("text-sm opacity-70")
+        return
+
+    n_total = len(scans)
+    not_ready = [s for s in scans if not scan_is_deconvolved(state, s)]
+    plural = "s" if n_total != 1 else ""
+    if not not_ready:
+        ui.label(
+            f"All {n_total} checked scan{plural} are deconvolution-"
+            "preprocessed and ready."
+        ).classes("text-sm text-emerald-400")
+        return
+
+    ui.label(
+        f"{len(not_ready)} of {n_total} checked scan{plural} aren't "
+        "deconvolution-preprocessed yet. The bulk run preprocesses each scan "
+        "automatically — or preprocess them all now."
+    ).classes("text-sm opacity-70")
+    with ui.row().classes("items-center gap-2"):
+        ui.button(
+            "Preprocess all checked",
+            icon="play_arrow",
+            on_click=lambda: preprocess_all_checked(state, scans),
+        ).props("color=primary")
+        ui.label(
+            "Uses default settings — for custom options use the Preprocess tab."
+        ).classes("text-xs opacity-60")
+
+
 def _resolve_checked_scans(state: AppState) -> list:
     """Resolve ``state.checked_scan_paths`` to ScanEntries in manifest order.
 

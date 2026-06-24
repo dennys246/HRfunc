@@ -112,6 +112,13 @@ def _snapshot_options(state: AppState, opts: "ActivityOptions") -> "ActivityOpti
         drop_failed_channels=opts.drop_failed_channels,
         library_trace=kernel[0] if kernel else None,
         library_oxygenation=kernel[1] if kernel else True,
+        # Per-channel matching settings travel with the snapshot; the actual
+        # ``library_traces`` map is computed per scan at run time (it depends
+        # on each scan's channel geometry), not captured here.
+        library_per_channel=opts.library_per_channel,
+        library_strategy=opts.library_strategy,
+        library_radius_mm=opts.library_radius_mm,
+        library_uncovered=opts.library_uncovered,
     )
 
 
@@ -136,6 +143,46 @@ class ActivityOptions:
     # selection changes mid-run. None in other modes.
     library_trace: Optional[list] = None
     library_oxygenation: bool = True
+    # Per-channel HRtree mapping (hrf_model == MODEL_LIBRARY). When
+    # ``library_per_channel`` is True and the user's ROIs yield candidates,
+    # each channel is deconvolved with its OWN spatially-matched HRF instead
+    # of one shared kernel. ``library_strategy`` picks individual-HRF vs
+    # ROI-mean matching; ``library_radius_mm`` is the max match distance;
+    # ``library_uncovered`` is 'skip' (drop unmatched channels) or 'canonical'.
+    # ``library_traces`` is the computed {ch_name: trace} map, filled per scan
+    # at run time (None until then; differs per scan so it is NOT snapshotted
+    # at the panel level).
+    library_per_channel: bool = True
+    library_strategy: str = "individual"
+    library_radius_mm: float = 20.0
+    library_uncovered: str = "skip"
+    library_traces: Optional[dict] = None
+
+
+def _compute_library_traces(
+    state: AppState, raw, opts: "ActivityOptions"
+) -> Optional[dict]:
+    """Per-channel HRtree ``{ch_name: trace}`` map for ONE scan's raw, or None.
+
+    Returns None — telling the run path to fall back to the single shared
+    kernel — when not in per-channel library mode, when the spatial match
+    raises, or when no channel found a same-oxygenation HRF within range.
+    Computed per scan because each scan's channel geometry differs.
+    """
+    if opts.hrf_model != MODEL_LIBRARY or not opts.library_per_channel:
+        return None
+    try:
+        from .hrtree_match import match_channels_to_hrtree
+        res = match_channels_to_hrtree(
+            state, raw,
+            strategy=opts.library_strategy,
+            radius_mm=opts.library_radius_mm,
+        )
+    except Exception as exc:  # noqa: BLE001 — never break a run on a match error
+        logger.warning("HRtree per-channel match failed: %s", exc)
+        return None
+    traces = res.library_traces()
+    return traces or None
 
 
 def render(state: AppState) -> None:
@@ -206,6 +253,12 @@ def _render_body(state: AppState, opts: ActivityOptions) -> None:
                         f"Bulk run on {len(checked_scans)} checked scan"
                         f"{'s' if len(checked_scans) != 1 else ''}."
                     ).classes("text-sm font-mono opacity-70")
+                    # Bulk preprocess readiness + one-click "Preprocess all
+                    # checked" (the deconvolution the bulk run needs). The
+                    # bulk run preprocesses on demand too, so this is a
+                    # readout + convenience, not a prerequisite.
+                    from .preprocess_panel import render_preprocess_all_checked
+                    render_preprocess_all_checked(state, checked_scans)
                 elif scan is not None:
                     ui.label(scan.display_name or scan.path.name).classes(
                         "text-sm font-mono opacity-70"
@@ -422,7 +475,7 @@ def _render_hrf_source_column(
     if opts.hrf_model == MODEL_TOEPLITZ:
         _render_estimated_source_status(state, scan, bulk_mode)
     elif opts.hrf_model == MODEL_LIBRARY:
-        _render_library_source_status(state)
+        _render_library_source_status(state, scan, opts, bulk_mode)
     else:
         _render_canonical_source_status(state, scan)
 
@@ -449,13 +502,201 @@ def _go_to_hrtree_button(state: AppState) -> None:
         ).props("flat dense color=primary")
 
 
-def _render_library_source_status(state: AppState) -> None:
+def _visible_roi_count(state: AppState) -> int:
+    """Number of visible ROIs the user has built in the HRtree (0 on error)."""
+    try:
+        from .hrtree_panel import _visible_shapes
+        return len(_visible_shapes(state))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _render_library_source_status(
+    state: AppState,
+    scan: Optional[ScanEntry],
+    opts: "ActivityOptions",
+    bulk_mode: bool,
+) -> None:
     """Status + preview for the "HRtree HRF" (library) source.
 
-    Uses the HRF currently selected in the HRtree tab
-    (``state.library_selected_hrf``) as the single deconvolution kernel for
-    every channel. Prompts the user to the HRtree tab when nothing is picked.
+    Two sub-modes:
+    - **Per-channel** (default when the user has built ROIs): each scan channel
+      is matched to its own HRtree HRF; shows coverage counts + a per-channel
+      assignment column.
+    - **Single HRF**: one selected HRF applied to every channel (the original
+      behaviour), used when there are no ROIs.
     """
+    n_rois = _visible_roi_count(state)
+    has_single = _library_kernel_from_state(state) is not None
+
+    # Nothing to work with at all -> point the user at the HRtree tab.
+    if n_rois == 0 and not has_single:
+        ui.label("No HRtree HRFs selected yet.").classes("text-sm opacity-70")
+        ui.label(
+            "Open the HRtree tab and build ROIs from a montage (per-channel "
+            "matching), or click a single HRF to use as one shared kernel."
+        ).classes("text-xs opacity-60")
+        _go_to_hrtree_button(state)
+        return
+
+    # Mode toggle (only meaningful once ROIs exist).
+    if n_rois > 0:
+        def _set_mode(value) -> None:
+            opts.library_per_channel = bool(value)
+            state.publish("scan_selected", state.selected_scan)
+
+        ui.radio(
+            {True: "Per-channel (from ROIs)", False: "Single HRF"},
+            value=opts.library_per_channel,
+            on_change=lambda e: _set_mode(e.value),
+        ).props("inline dense").classes("text-sm")
+
+    if opts.library_per_channel and n_rois > 0:
+        _render_library_per_channel_status(state, scan, opts, bulk_mode, n_rois)
+    else:
+        _render_library_single_status(state)
+
+
+def _render_library_per_channel_status(
+    state: AppState,
+    scan: Optional[ScanEntry],
+    opts: "ActivityOptions",
+    bulk_mode: bool,
+    n_rois: int,
+) -> None:
+    """Per-channel HRtree matching: controls + coverage counts + assignment."""
+    from .hrtree_match import (
+        STRATEGY_INDIVIDUAL,
+        STRATEGY_ROI_MEAN,
+        match_channels_to_hrtree,
+    )
+
+    def _rerender() -> None:
+        state.publish("scan_selected", state.selected_scan)
+
+    # ── Matching strategy (the user picks between the two approaches).
+    def _set_strategy(value) -> None:
+        opts.library_strategy = value
+        _rerender()
+
+    ui.radio(
+        {STRATEGY_INDIVIDUAL: "Nearest HRF", STRATEGY_ROI_MEAN: "ROI mean"},
+        value=opts.library_strategy,
+        on_change=lambda e: _set_strategy(e.value),
+    ).props("inline dense").classes("text-xs")
+
+    # ── Match radius (mm).
+    def _set_radius(value) -> None:
+        try:
+            opts.library_radius_mm = max(1.0, float(value))
+        except (TypeError, ValueError):
+            opts.library_radius_mm = 20.0
+        _rerender()
+
+    ui.number(
+        "Match radius (mm)",
+        value=opts.library_radius_mm,
+        min=1.0, max=200.0, step=1.0, format="%.0f",
+        on_change=lambda e: _set_radius(e.value),
+    ).props("dense").classes("w-40")
+
+    # ── Uncovered-channel handling (lives here in the right column, per the
+    # request). Default 'skip' fails loudly; user can switch to canonical.
+    def _set_uncovered(value) -> None:
+        opts.library_uncovered = value
+        _rerender()
+
+    ui.radio(
+        {"skip": "Skip uncovered", "canonical": "Canonical fallback"},
+        value=opts.library_uncovered,
+        on_change=lambda e: _set_uncovered(e.value),
+    ).props("inline dense").classes("text-xs")
+    _go_to_hrtree_button(state)
+
+    # ── Coverage needs a single, preprocessed scan to match against. In bulk
+    # mode each scan matches its own geometry at run time, so just summarise.
+    preview_scan = scan if not bulk_mode else None
+    if preview_scan is None or preview_scan not in state.processed_cache:
+        ui.label(
+            f"{n_rois} ROI{'s' if n_rois != 1 else ''} selected. Coverage is "
+            "computed per scan at run time — select a single preprocessed scan "
+            "to preview which channels match."
+        ).classes("text-sm opacity-70")
+        return
+
+    raw = state.processed_cache.get(preview_scan)
+    try:
+        res = match_channels_to_hrtree(
+            state, raw,
+            strategy=opts.library_strategy,
+            radius_mm=opts.library_radius_mm,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("HRtree coverage preview failed: %s", exc)
+        ui.label("Coverage preview unavailable.").classes("text-sm opacity-60")
+        return
+
+    n_cov = len(res.covered)
+    n_unc = len(res.uncovered)
+    total = len(res.matches)
+    # ── Headline counts at the top.
+    ui.label(
+        f"{n_cov}/{total} channels covered · {n_unc} uncovered · "
+        f"{res.n_candidate_hrfs} HRF{'s' if res.n_candidate_hrfs != 1 else ''} "
+        f"across {res.n_rois} ROI{'s' if res.n_rois != 1 else ''}"
+    ).classes("text-sm font-medium")
+    if n_unc:
+        if opts.library_uncovered == "skip":
+            ui.label(
+                f"{n_unc} uncovered channel{'s' if n_unc != 1 else ''} will be "
+                "DROPPED from the output (switch to canonical to keep them)."
+            ).classes("text-xs text-amber-400")
+        else:
+            ui.label(
+                f"{n_unc} uncovered channel{'s' if n_unc != 1 else ''} will use "
+                "the canonical HRF."
+            ).classes("text-xs opacity-60")
+
+    _render_match_gallery(res)
+
+
+def _render_match_gallery(res) -> None:
+    """Per-channel assignment column: each channel + its matched HRF or
+    'uncovered' (mirrors the per-channel HRF columns on the other tabs)."""
+    from types import SimpleNamespace
+
+    ui.label("Per-channel HRF assignment").classes(
+        "text-xs uppercase opacity-60 tracking-wide mt-2"
+    )
+    with ui.column().classes(
+        "w-full gap-1 max-h-96 overflow-auto border border-slate-700 "
+        "rounded p-2"
+    ):
+        for m in res.matches:
+            with ui.row().classes("items-center gap-2 w-full no-wrap"):
+                if m.matched:
+                    try:
+                        from .hrf_panel import _render_mini_hrf_png
+                        png = _render_mini_hrf_png(
+                            SimpleNamespace(trace=m.trace)
+                        )
+                    except Exception:  # noqa: BLE001
+                        png = None
+                    if png is not None:
+                        ui.image(png).style("width:3rem;height:2rem;")
+                    ui.label(m.ch_name).classes("text-xs font-mono")
+                    dist = f"  ({m.distance_mm:.0f} mm)" if m.distance_mm is not None else ""
+                    ui.label(f"→ {m.source}{dist}").classes(
+                        "text-xs opacity-60 truncate"
+                    )
+                else:
+                    ui.icon("block").classes("text-amber-500")
+                    ui.label(m.ch_name).classes("text-xs font-mono opacity-70")
+                    ui.label("uncovered").classes("text-xs text-amber-500")
+
+
+def _render_library_single_status(state: AppState) -> None:
+    """Single-kernel HRtree source: one selected HRF for every channel."""
     hrf = getattr(state, "library_selected_hrf", None)
     kernel = _library_kernel_from_state(state)
 
@@ -523,7 +764,40 @@ def _render_estimated_source_status(
     HRFs are cached per scan (``state.montage_cache``), so each scan is
     deconvolved with its OWN HRFs — single or bulk. Reports this scan's
     readiness (single mode) or a batch summary (bulk mode).
+
+    When a pooled group montage exists (≥2 subjects estimated on the HRFs
+    tab), a toggle lets the user deconvolve every scan with the GROUP HRFs
+    instead — matched by channel name, so it also covers scans that weren't
+    individually estimated.
     """
+    n_group = _group_subject_count(state)
+    group_available = (
+        state.project_montage is not None
+        and not isinstance(state.project_montage, _CanonicalResult)
+        and n_group >= 2
+    )
+    if group_available:
+        def _set_group(event) -> None:
+            state.activity_use_group_hrfs = bool(event.value)
+            state.publish("scan_selected", state.selected_scan)
+
+        ui.radio(
+            {False: "Each scan's own HRFs", True: f"Group HRFs ({n_group})"},
+            value=state.activity_use_group_hrfs,
+            on_change=_set_group,
+        ).props("inline dense").classes("text-xs")
+    elif state.activity_use_group_hrfs:
+        # Group montage went away (project reset / re-estimate) — fall back.
+        state.activity_use_group_hrfs = False
+
+    if state.activity_use_group_hrfs and group_available:
+        ui.label(
+            f"Deconvolving every scan with the GROUP HRFs ({n_group} subjects), "
+            "matched by channel name."
+        ).classes("text-sm opacity-70")
+        _safe_render_gallery(state, state.project_montage)
+        return
+
     if bulk_mode:
         n_cached = len(state.montage_cache)
         ui.label(
@@ -837,6 +1111,14 @@ def _run_dispatch(
         _run(state, selected, opts)
 
 
+def _group_subject_count(state: AppState) -> int:
+    """Number of scans pooled into the group montage (non-canonical cache)."""
+    return sum(
+        1 for m in state.montage_cache.values()
+        if m is not None and not isinstance(m, _CanonicalResult)
+    )
+
+
 def _montage_for_scan(state: AppState, scan: Optional[ScanEntry]):
     """The per-channel Montage to use for toeplitz activity on ``scan``.
 
@@ -845,6 +1127,15 @@ def _montage_for_scan(state: AppState, scan: Optional[ScanEntry]):
     runs. Falls back to the single most-recent ``state.montage`` when it was
     estimated for this exact scan. Returns None when neither applies.
     """
+    # Group mode: deconvolve EVERY scan with the pooled project montage
+    # (matched by channel name in estimate_activity), so a group HRF can be
+    # applied even to scans that weren't individually estimated.
+    if (
+        getattr(state, "activity_use_group_hrfs", False)
+        and state.project_montage is not None
+        and not isinstance(state.project_montage, _CanonicalResult)
+    ):
+        return state.project_montage
     if scan is None:
         return None
     cached = state.montage_cache.get(scan.path.resolve())
@@ -916,7 +1207,10 @@ def _run_bulk(
                 return reason  # intentional skip carrying its reason
             existing_montage = _montage_for_scan(state, scan)
         elif snapshot.hrf_model == MODEL_LIBRARY:
-            if snapshot.library_trace is None:
+            # Per-channel mode resolves each scan's own HRtree match in the
+            # worker below, so it doesn't need a single selected kernel here;
+            # single-kernel mode still does.
+            if not snapshot.library_per_channel and snapshot.library_trace is None:
                 return (
                     "no HRtree HRF selected — pick one in the HRtree tab to "
                     "use as the deconvolution kernel"
@@ -935,7 +1229,23 @@ def _run_bulk(
             # ensure_deconvolved_raw raises a specific reason on failure.
             from .preprocess_panel import ensure_deconvolved_raw
             raw = ensure_deconvolved_raw(state, scan)
-            return run_activity_sync(raw, snapshot, existing_montage, progress_cb)
+            scan_snapshot = snapshot
+            if snapshot.hrf_model == MODEL_LIBRARY and snapshot.library_per_channel:
+                # Match THIS scan's channels to the HRtree ROIs.
+                import dataclasses
+                traces = _compute_library_traces(state, raw, snapshot)
+                scan_snapshot = dataclasses.replace(
+                    snapshot, library_traces=traces
+                )
+                if not traces and snapshot.library_trace is None:
+                    raise RuntimeError(
+                        "no HRtree HRFs matched any channel of this scan within "
+                        f"{snapshot.library_radius_mm:.0f} mm — widen the radius, "
+                        "add ROIs, or select a single HRF as a fallback"
+                    )
+            return run_activity_sync(
+                raw, scan_snapshot, existing_montage, progress_cb
+            )
 
         return (_pp_and_estimate, (), {})
 
@@ -1112,17 +1422,22 @@ def _run(
                 "HRFs tab (toeplitz mode), or switch the source to canonical."
             )
             return
-    elif opts.hrf_model == MODEL_LIBRARY:
-        if _library_kernel_from_state(state) is None:
+    raw = state.processed_cache.get(scan)
+
+    library_traces = None
+    if opts.hrf_model == MODEL_LIBRARY:
+        # Per-channel HRtree map for this scan (None => single-kernel fallback).
+        library_traces = _compute_library_traces(state, raw, opts)
+        if not library_traces and _library_kernel_from_state(state) is None:
             state.last_error = (
-                "Select an HRF in the HRtree tab to use as the deconvolution "
-                "kernel first."
+                "No HRtree HRFs to deconvolve with. Build ROIs in the HRtree "
+                "for per-channel matching, or select a single HRF there first."
             )
             return
 
     snapshot = _snapshot_options(state, opts)
+    snapshot.library_traces = library_traces
 
-    raw = state.processed_cache.get(scan)
     progress_cb = make_progress_callback(state)
     existing_montage = (
         _montage_for_scan(state, scan)
@@ -1207,8 +1522,14 @@ def run_activity_sync(
         "drop_failed_channels": opts.drop_failed_channels,
     }
     if opts.hrf_model == MODEL_LIBRARY:
-        estimate_kwargs["library_trace"] = opts.library_trace
-        estimate_kwargs["library_oxygenation"] = opts.library_oxygenation
+        if opts.library_traces:
+            # Per-channel HRtree map (already matched per this scan's channels).
+            estimate_kwargs["library_traces"] = opts.library_traces
+            estimate_kwargs["library_uncovered"] = opts.library_uncovered
+        else:
+            # Single-kernel fallback (one selected HRF for every channel).
+            estimate_kwargs["library_trace"] = opts.library_trace
+            estimate_kwargs["library_oxygenation"] = opts.library_oxygenation
 
     try:
         result = m.estimate_activity(
