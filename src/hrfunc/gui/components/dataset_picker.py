@@ -290,9 +290,16 @@ def render(state: AppState) -> None:
 
         if state.manifest is not None:
             ui.separator()
+
+            # NOTE: pass the coroutine function directly (NOT a sync lambda
+            # wrapping it) so NiceGUI awaits the confirm dialog -- a sync
+            # lambda returning a coroutine silently no-ops.
+            async def _close_clicked() -> None:
+                await _on_close_project(state, menu)
+
             close_item = ui.menu_item(
                 "Close project",
-                on_click=lambda: _on_close_project(state, menu),
+                on_click=_close_clicked,
             )
             if busy:
                 close_item.props("disable")
@@ -337,12 +344,34 @@ def _on_pick_recent(state: AppState, manifest: Manifest, menu) -> None:
     state.set_manifest(manifest)
 
 
-def _on_close_project(state: AppState, menu) -> None:
+async def _on_close_project(state: AppState, menu) -> None:
     """Clear the active project without touching cached library data.
 
     Uses :meth:`AppState.set_manifest` rather than :meth:`reset` so the
     bundled HRtree library and event subscribers survive — closing a
     project shouldn't kick the user out of the Library tab.
+
+    Confirms first when closing would discard in-memory results: estimated
+    HRFs (``montage_cache``) and deconvolutions (``activity_cache``) are not
+    auto-persisted, and ``set_manifest(None)`` clears them.
     """
     menu.close()
+    has_unsaved = bool(state.montage_cache) or len(state.activity_cache) > 0
+    if has_unsaved:
+        with ui.dialog() as dlg, ui.card():
+            ui.label("Close project?").classes("text-lg font-bold")
+            ui.label(
+                "This discards the estimated HRFs and deconvolutions held in "
+                "memory for this project — they are not auto-saved. Save "
+                "anything you want to keep (HRFs / activity / montage) first."
+            ).classes("text-sm")
+            with ui.row().classes("justify-end w-full"):
+                ui.button(
+                    "Cancel", on_click=lambda: dlg.submit(False)
+                ).props("flat")
+                ui.button(
+                    "Close anyway", on_click=lambda: dlg.submit(True)
+                ).props("color=negative")
+        if not await dlg:
+            return
     state.set_manifest(None)

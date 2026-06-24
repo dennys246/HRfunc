@@ -317,6 +317,44 @@ class TestRunPipelineSync:
         result = preprocess_panel.run_pipeline_sync(raw, opts)
         assert result is not None
 
+    def test_deconvolution_forces_beer_lambert(self, monkeypatch):
+        """Deconvolution mode must convert OD -> haemoglobin even when the
+        Beer-Lambert toggle is OFF: HRF/activity estimation operate on
+        haemoglobin and the deconvolution result is what marks a scan
+        estimation-ready, so OD-space data must never reach the gate."""
+        import numpy as np
+
+        raw = _make_fake_raw()
+        fake_od = _make_fake_raw()
+        bl_called = []
+
+        def fake_optical_density(r, verbose="ERROR"):
+            return fake_od
+
+        def fake_sci(r, verbose="ERROR"):
+            return np.ones(len(r.ch_names))
+
+        def fake_tddr(r, verbose="ERROR"):
+            return r
+
+        def fake_beer_lambert(r, ppf=0.1):
+            bl_called.append(True)
+            return r
+
+        import mne.preprocessing.nirs as mne_nirs
+        monkeypatch.setattr(mne_nirs, "optical_density", fake_optical_density)
+        monkeypatch.setattr(mne_nirs, "scalp_coupling_index", fake_sci)
+        monkeypatch.setattr(mne_nirs, "tddr", fake_tddr)
+        monkeypatch.setattr(mne_nirs, "beer_lambert_law", fake_beer_lambert)
+
+        opts = preprocess_panel.PreprocessOptions(
+            deconvolution=True,
+            apply_beer_lambert=False,   # toggle OFF — must be overridden
+            apply_baseline_correct=False,
+        )
+        preprocess_panel.run_pipeline_sync(raw, opts)
+        assert bl_called, "Beer-Lambert must be forced in deconvolution mode"
+
     def test_motion_correction_toggle_skips_tddr(self, monkeypatch):
         import numpy as np
 

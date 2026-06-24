@@ -159,18 +159,31 @@ class TestBackwardsCompatibility:
                      'cond_thresh', 'timeout'):
             assert name in sig.parameters
 
-    def test_estimate_hrf_progress_callback_is_last_param(self):
-        """Positional ordering: progress_callback must come after the existing
-        params so old positional calls like
-        `estimate_hrf(nirx, events, 30.0, 1e-3, 0.15, True)` keep binding the
-        same names."""
-        from hrfunc.hrfunc import montage
-        sig = inspect.signature(montage.estimate_hrf)
-        params = list(sig.parameters.keys())
-        assert params[-1] == 'progress_callback'
+    def test_estimate_hrf_progress_callback_keeps_positional_slot(self):
+        """Backwards-compat contract: the historical positional parameters
+        through ``progress_callback`` keep their exact order, so old positional
+        calls like ``estimate_hrf(nirx, events, 30.0, 1e-3, 0.15, True, cb)``
+        bind the same names.
 
-    def test_estimate_activity_progress_callback_is_last_param(self):
+        New parameters are APPENDED AFTER ``progress_callback`` (e.g. timeout,
+        source_id) -- that is the correct, non-breaking way to extend the
+        signature. So assert the leading prefix is intact (nothing inserted
+        BEFORE progress_callback), NOT that progress_callback is literally the
+        last parameter (which would force new params in front of it and break
+        positional binding)."""
         from hrfunc.hrfunc import montage
-        sig = inspect.signature(montage.estimate_activity)
-        params = list(sig.parameters.keys())
-        assert params[-1] == 'progress_callback'
+        params = list(inspect.signature(montage.estimate_hrf).parameters)
+        expected_prefix = [
+            'self', 'nirx_obj', 'events', 'duration', 'lmbda',
+            'edge_expansion', 'preprocess', 'progress_callback',
+        ]
+        assert params[:len(expected_prefix)] == expected_prefix
+
+    def test_estimate_activity_progress_callback_keeps_positional_slot(self):
+        from hrfunc.hrfunc import montage
+        params = list(inspect.signature(montage.estimate_activity).parameters)
+        expected_prefix = [
+            'self', 'nirx_obj', 'lmbda', 'hrf_model', 'preprocess',
+            'cond_thresh', 'timeout', 'progress_callback',
+        ]
+        assert params[:len(expected_prefix)] == expected_prefix

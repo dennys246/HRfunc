@@ -286,11 +286,31 @@ def render(
             if visible_paths
             else "Select all"
         )
-        ui.checkbox(
-            select_all_label,
-            value=all_ticked,
-            on_change=_on_select_all,
-        ).props("dense").classes("text-xs")
+        def _on_clear_checked() -> None:
+            # Clear the ENTIRE checked set (not just the visible/filtered
+            # subset) so a sticky bulk selection can be reset in one click --
+            # the set is global across tabs, so this is the escape hatch from
+            # an unexpected bulk mode on a later tab.
+            state.checked_scan_paths = set()
+            _tree_body.refresh()
+            state.publish("checked_changed", state.checked_scan_paths)
+
+        with ui.row().classes("items-center gap-2 w-full"):
+            ui.checkbox(
+                select_all_label,
+                value=all_ticked,
+                on_change=_on_select_all,
+            ).props("dense").classes("text-xs")
+            total_checked = len(state.checked_scan_paths)
+            if total_checked:
+                ui.button(
+                    f"Clear ({total_checked})",
+                    icon="clear",
+                    on_click=_on_clear_checked,
+                ).props("flat dense color=primary").classes("text-xs").tooltip(
+                    "Clear the checked-scan selection used for bulk actions "
+                    "(Preprocess / HRFs / Neural Activity)."
+                )
 
         # Initial ``ticked`` reflects state.checked_scan_paths so the
         # tree re-renders with the saved selection after tab switches.

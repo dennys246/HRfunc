@@ -172,11 +172,16 @@ def render_recording_sections(raw: "mne.io.BaseRaw") -> None:
         else:
             rows = [
                 {
+                    # Unique per-row key: two annotations at the same onset
+                    # (common with simultaneous multi-condition markers) would
+                    # collapse to one row under row_key="onset" since Quasar
+                    # de-duplicates by key.
+                    "_idx": i,
                     "description": str(ann["description"]),
                     "onset": f"{float(ann['onset']):.3f}",
                     "duration": f"{float(ann['duration']):.3f}",
                 }
-                for ann in annotations
+                for i, ann in enumerate(annotations)
             ]
             ui.table(
                 columns=[
@@ -200,7 +205,7 @@ def render_recording_sections(raw: "mne.io.BaseRaw") -> None:
                     },
                 ],
                 rows=rows,
-                row_key="onset",
+                row_key="_idx",
             ).classes("w-full")
 
 

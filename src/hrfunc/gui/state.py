@@ -251,11 +251,17 @@ class AppState:
     selected_scan: Optional[ScanEntry] = None
     raw_cache: RawCache = field(default_factory=RawCache)
     processed_cache: RawCache = field(default_factory=RawCache)
-    # LRU(3) of *deconvolved* (neural-activity) Raw objects, keyed per scan.
-    # ``activity_raw`` only holds the single most-recent result; this cache
-    # keeps each scan's deconvolution so channel-wise 3-stage QC (raw vs
-    # hemoglobin vs activity) can read a scan's activity without re-running.
-    activity_cache: RawCache = field(default_factory=RawCache)
+    # UNBOUNDED cache of *deconvolved* (neural-activity) Raw objects, keyed
+    # per scan. ``activity_raw`` only holds the single most-recent result;
+    # this cache keeps each scan's deconvolution so channel-wise 3-stage QC
+    # (raw vs hemoglobin vs activity) can read it without re-running AND so a
+    # bulk "Save all activity" can write every checked scan. That save-all
+    # need is why this cache is unbounded (``maxsize=None``) rather than the
+    # LRU(3) used for navigation caches: an LRU would silently evict all but
+    # the last 3 deconvolutions, so the bulk save would skip the rest. The
+    # working set is bounded instead by ``_clear_project_data`` clearing it
+    # on every project switch.
+    activity_cache: RawCache = field(default_factory=lambda: RawCache(maxsize=None))
     preload_path: Optional[Path] = None
     busy: bool = False
     estimation_progress: Optional[Tuple[int, int, str]] = None
@@ -274,6 +280,11 @@ class AppState:
     # bulk run. ``None`` when no bulk run is in flight. Set by
     # ``workers.run_bulk_in_background`` as it advances.
     bulk_progress: Optional[Tuple[int, int, ScanEntry]] = None
+    # Cooperative cancel flag for an in-flight bulk run. The Cancel button in
+    # the bulk-progress UI sets it; ``run_bulk_in_background`` checks it before
+    # each scan and stops gracefully (the current scan finishes). Reset at the
+    # start and end of every bulk run.
+    cancel_requested: bool = False
     last_error: Optional[str] = None
     subscribers: Dict[str, List[EventCallback]] = field(default_factory=dict)
     # Montage from the most recent HRF estimation (Sprint 3.3). Typed as Any to
@@ -806,24 +817,69 @@ class AppState:
         Per-scan state that is meaningless against a different project is
         cleared here, not just in ``reset()``: the picker drives every
         project change (open / switch-to-recent / close) through this
-        method, never through ``reset()``. Without the clear, the previous
-        project's ``selected_scan`` and cached Raws leak into the Inspect
-        panel, and its ``checked_scan_paths`` can silently pre-check (and
-        bulk-include) a colliding path in the new project. A ``scan_selected``
-        None is published so panels keyed only on that event (Inspect) blank
-        themselves. Idempotent: setting the manifest already in place is a
-        no-op so a stray re-set can't wipe a live selection.
+        method, never through ``reset()``. The clear is delegated to
+        :meth:`_clear_project_data` so it stays in lock-step with
+        ``reset()`` -- previously this method cleared only ``selected_scan``,
+        the nav caches and ``checked_scan_paths``, leaking the prior
+        project's ``montage_cache`` / ``project_montage`` /
+        ``processed_deconvolved`` / ``quality_metrics`` into the new
+        project. That made the group-HRF pool (``_sourced_project_montages``)
+        silently average subjects across two different datasets and let a
+        stale ``*_source_scan`` false-match a colliding path. A
+        ``scan_selected`` None is published so panels keyed only on that
+        event (Inspect) blank themselves. Idempotent: setting the manifest
+        already in place is a no-op so a stray re-set can't wipe a live
+        selection.
         """
         if manifest is self.manifest:
             return
+        self._clear_project_data()
         self.manifest = manifest
+        self.publish("project_changed", manifest)
+        self.publish("scan_selected", None)
+
+    def _clear_project_data(self) -> None:
+        """Drop every piece of per-project scan / estimation state.
+
+        Shared by :meth:`set_manifest` (project switch) and :meth:`reset`
+        (full close) so the two can't drift. Everything cleared here is
+        meaningless against a different project and MUST go on a switch --
+        otherwise the previous project's montages linger in ``montage_cache``
+        and the group pool mixes subjects across projects (a
+        scientific-correctness defect). Deliberately does NOT touch
+        process-level plumbing (``subscribers``, ``busy``, ``preload_path``)
+        or the read-only bundled /library view state (filter, oxygenation,
+        cluster ROIs); those are reset only by ``reset()`` since the library
+        browser is independent of the loaded project.
+        """
         self.selected_scan = None
         self.raw_cache.clear()
         self.processed_cache.clear()
+        self.activity_cache.clear()
+        self.montage = None
+        self.montage_source_scan = None
+        self.montage_cache.clear()
+        self.project_montage = None
+        self.hrf_preview_group = True
+        self.project_group_excluded.clear()
+        self.activity_raw = None
+        self.activity_source_scan = None
+        self.quality_metrics.clear()
+        self.processed_deconvolved.clear()
         self.checked_scan_paths.clear()
         self.bulk_progress = None
-        self.publish("project_changed", manifest)
-        self.publish("scan_selected", None)
+        self.cancel_requested = False
+        self.estimation_progress = None
+        self.last_error = None
+        self.events_rows = None
+        self.events_impulse = None
+        self.events_format = None
+        self.events_source_label = None
+        self.events_apply_all = False
+        self.events_source_scan = None
+        self.events_is_automatched = False
+        self.events_no_automatch.clear()
+        self.hrf_selected_channel = None
 
     def reset(self) -> None:
         """Return to the welcome-screen state.
@@ -833,41 +889,18 @@ class AppState:
         The RawCache instances are kept (not reassigned) so any references
         held elsewhere stay valid. Event subscribers and the estimated
         Montage are also cleared — a fresh dataset is a clean slate.
+
+        The per-project scan / estimation fields are cleared via the shared
+        :meth:`_clear_project_data` (the same helper ``set_manifest`` uses);
+        this method adds the process-level teardown (manifest, subscribers,
+        busy, preload) and the /library view reset that a full close also
+        wants.
         """
+        self._clear_project_data()
         self.manifest = None
-        self.selected_scan = None
-        self.raw_cache.clear()
-        self.processed_cache.clear()
-        self.activity_cache.clear()
-        self.montage_cache.clear()
-        self.project_montage = None
-        self.hrf_preview_group = True
-        self.project_group_excluded.clear()
         self.preload_path = None
         self.busy = False
-        self.estimation_progress = None
-        # PR #55a: bulk-iterate state cleared on project switch -- the
-        # checked set is meaningless against a different manifest, and
-        # bulk_progress can't survive a busy=False without leaking a
-        # stale "still running" display.
-        self.checked_scan_paths.clear()
-        self.bulk_progress = None
-        self.last_error = None
         self.subscribers.clear()
-        self.montage = None
-        self.montage_source_scan = None
-        self.activity_raw = None
-        self.events_rows = None
-        self.events_impulse = None
-        self.events_format = None
-        self.events_source_label = None
-        self.events_apply_all = False
-        self.events_source_scan = None
-        self.events_is_automatched = False
-        self.events_no_automatch.clear()
-        self.processed_deconvolved.clear()
-        self.activity_source_scan = None
-        self.quality_metrics.clear()
         # Note: library_hbo / library_hbr are deliberately NOT cleared by
         # reset(). They hold immutable bundled data loaded once per process;
         # re-loading on every dataset switch would burn ~100 ms unnecessarily.

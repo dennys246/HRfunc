@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from pathlib import Path
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 from .detect import classify_path
 from .manifest import ScanEntry
@@ -46,19 +46,24 @@ class RawCache:
     """LRU cache of loaded MNE Raw objects keyed by absolute path.
 
     Args:
-        maxsize: Maximum number of Raws to retain. Must be >= 1.
-            Default 3 — covers "previous / current / next" navigation
-            while bounding memory to roughly 3 × scan size. Large NIRx
-            recordings are ~100MB in memory; smaller SNIRF ones are
-            a few MB.
+        maxsize: Maximum number of Raws to retain. Must be >= 1, or
+            ``None`` for an UNBOUNDED cache (no eviction). Default 3 —
+            covers "previous / current / next" navigation while bounding
+            memory to roughly 3 × scan size. Large NIRx recordings are
+            ~100MB in memory; smaller SNIRF ones are a few MB. ``None`` is
+            for caches that must retain *every* entry for a workflow (e.g.
+            the Activity panel's per-scan deconvolutions, which a bulk
+            "Save all" reads back in full); those rely on the per-project
+            ``clear()`` (on project switch) to bound the working set
+            instead of LRU eviction.
 
     Raises:
-        ValueError: If ``maxsize < 1``.
+        ValueError: If ``maxsize`` is an int < 1.
     """
 
-    def __init__(self, maxsize: int = DEFAULT_MAXSIZE) -> None:
-        if maxsize < 1:
-            raise ValueError(f"maxsize must be >= 1, got {maxsize}")
+    def __init__(self, maxsize: Optional[int] = DEFAULT_MAXSIZE) -> None:
+        if maxsize is not None and maxsize < 1:
+            raise ValueError(f"maxsize must be >= 1 or None, got {maxsize}")
         self.maxsize = maxsize
         self._cache: "OrderedDict[Path, mne.io.BaseRaw]" = OrderedDict()
 
@@ -91,7 +96,7 @@ class RawCache:
 
         raw = self._load_from_disk(path)
         self._cache[path] = raw
-        if len(self._cache) > self.maxsize:
+        if self.maxsize is not None and len(self._cache) > self.maxsize:
             self._cache.popitem(last=False)
         return raw
 
@@ -111,7 +116,7 @@ class RawCache:
         path = self._extract_path(scan_or_path)
         self._cache[path] = raw
         self._cache.move_to_end(path)
-        if len(self._cache) > self.maxsize:
+        if self.maxsize is not None and len(self._cache) > self.maxsize:
             self._cache.popitem(last=False)
 
     def evict(self, scan_or_path: Union[ScanEntry, Path, str]) -> bool:

@@ -44,6 +44,7 @@ from ..workers import (
     capture_client,
     client_scope,
     notify_if_alive,
+    render_bulk_cancel_button,
     run_bulk_in_background,
     run_in_background,
     summarize_failures,
@@ -327,10 +328,18 @@ def _render_body(state: AppState, opts: PreprocessOptions) -> None:
             ui.label("Pipeline options").classes(
                 "text-xs uppercase opacity-60 tracking-wide"
             )
+            def _on_deconv_change(e) -> None:
+                opts.deconvolution = bool(e.value)
+                # Deconvolution mode requires haemoglobin; keep the flag
+                # consistent (the switch below renders forced-on + disabled on
+                # the next render, and run_pipeline_sync forces it regardless).
+                if opts.deconvolution:
+                    opts.apply_beer_lambert = True
+
             ui.switch(
                 "Deconvolution mode (polynomial detrend, skip bandpass)",
                 value=opts.deconvolution,
-                on_change=lambda e: setattr(opts, "deconvolution", bool(e.value)),
+                on_change=_on_deconv_change,
             )
             ui.switch(
                 "Motion correction (TDDR)",
@@ -339,13 +348,21 @@ def _render_body(state: AppState, opts: PreprocessOptions) -> None:
                     opts, "apply_motion_correction", bool(e.value)
                 ),
             )
-            ui.switch(
+            # In deconvolution mode Beer-Lambert is mandatory (HRF/activity
+            # estimation needs haemoglobin), so force it on and lock the
+            # switch — the pipeline applies it regardless (run_pipeline_sync).
+            _bl_switch = ui.switch(
                 "Beer-Lambert conversion to haemoglobin",
-                value=opts.apply_beer_lambert,
+                value=opts.apply_beer_lambert or opts.deconvolution,
                 on_change=lambda e: setattr(
                     opts, "apply_beer_lambert", bool(e.value)
                 ),
             )
+            if opts.deconvolution:
+                _bl_switch.props("disable").tooltip(
+                    "Required in deconvolution mode — HRF and activity "
+                    "estimation operate on haemoglobin concentration."
+                )
             # Baseline correct is only user-skippable in deconvolution mode.
             # In GLM mode, the library always applies it (see run_pipeline_sync
             # and PreprocessOptions docstring).
@@ -579,6 +596,7 @@ def _render_busy_progress(state: AppState) -> None:
                 ).classes("text-sm opacity-80")
             fraction = (idx + 1) / max(total, 1)
             ui.linear_progress(value=fraction).classes("w-64")
+            render_bulk_cancel_button(state)
     else:
         with ui.row().classes("items-center gap-2"):
             ui.spinner(size="sm")
@@ -637,7 +655,14 @@ def run_pipeline_sync(
     if opts.deconvolution:
         od = polynomial_detrend(od, order=3)
 
-    if opts.apply_beer_lambert:
+    # Beer-Lambert (OD -> haemoglobin concentration) is REQUIRED in
+    # deconvolution mode: HRF / activity estimation operate on haemoglobin,
+    # and a deconvolution-mode result is what marks a scan
+    # ``processed_deconvolved`` (the estimation gate). Honour the toggle only
+    # in GLM/diagnostic mode; force the conversion in deconvolution mode so
+    # the gate can never accept optical-density data that would yield
+    # scientifically meaningless HRFs.
+    if opts.apply_beer_lambert or opts.deconvolution:
         haemo = mne.preprocessing.nirs.beer_lambert_law(
             od.copy(), ppf=0.1
         )

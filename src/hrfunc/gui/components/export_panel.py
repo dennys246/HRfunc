@@ -86,6 +86,14 @@ def _render_body(state: AppState) -> None:
             "first, estimate HRFs, run Activity, or run Quality to unlock "
             "the corresponding exports."
         ).classes("text-sm opacity-70")
+        # The dataset-tree checkboxes drive bulk actions elsewhere; Export
+        # rows act on the selected scan. Clarify when a selection exists.
+        if state.checked_scan_paths:
+            ui.label(
+                f"Note: the {len(state.checked_scan_paths)} checked scan(s) "
+                "are for bulk actions on other tabs. Export rows act on the "
+                "selected scan."
+            ).classes("text-xs opacity-60 italic")
 
         if scan is None:
             ui.label("Select a scan from the dataset tree.").classes(
@@ -253,6 +261,17 @@ async def _save_processed(state: AppState, scan) -> None:
 async def _save_activity(state: AppState, scan, naming=None) -> None:
     if state.activity_raw is None:
         state.last_error = "No activity scan available."
+        return
+    # Defensive source-scan gate: ``activity_raw`` is a single global slot not
+    # cleared on scan change. Refuse to write it under a different scan's name
+    # (which would also make the dropped-channel count below meaningless).
+    src = state.activity_source_scan
+    if scan is not None and src is not None and src.path != scan.path:
+        state.last_error = (
+            "The in-memory deconvolution belongs to a different scan "
+            f"({src.path.name}). Re-estimate this scan before saving."
+        )
+        ui.notify(state.last_error, type="negative")
         return
     postfix = (naming or {}).get("postfix", "_deconvolved")
     ext = (naming or {}).get("ext", ".snirf")

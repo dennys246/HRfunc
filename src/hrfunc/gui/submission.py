@@ -363,6 +363,96 @@ class SubmissionResult:
     message: str
 
 
+def _iter_hrf_entries(data: Any, key: Optional[str] = None):
+    """Yield ``(name, entry)`` for every HRF block in a payload.
+
+    Handles both saved shapes: a dict keyed by channel name whose values are
+    HRF entries (``montage.save``), and a list of ROI entries
+    (``build_roi_entry``), plus any wrapper nesting. An HRF entry is any dict
+    carrying an ``hrf_mean`` key.
+    """
+    if isinstance(data, dict):
+        if "hrf_mean" in data:
+            yield (key or data.get("name") or data.get("roi_anchor_key")
+                   or "HRF", data)
+            return
+        for k, v in data.items():
+            yield from _iter_hrf_entries(v, k)
+    elif isinstance(data, list):
+        for i, v in enumerate(data):
+            yield from _iter_hrf_entries(v, key=f"#{i}")
+
+
+def inspect_payload_quality(payload_path: Path) -> list[str]:
+    """Best-effort scientific sanity check of an HRF payload before submit.
+
+    Returns a list of human-readable WARNINGS (empty = looks fine). Never
+    raises -- on an unreadable / unexpected structure it returns either an
+    empty list (JSON validity is checked separately by :func:`submit_payload`)
+    or a single soft note, so the caller can still let the user proceed.
+
+    Flags, per HRF entry: a flat/degenerate mean trace (zero or no finite
+    variation), a missing/non-positive sampling frequency, and fewer than 2
+    contributing subject estimates (a single-estimate HRF has no
+    between-subject variability and is weak evidence for the shared library).
+    """
+    import numpy as np
+
+    try:
+        data = json.loads(payload_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 -- JSON validity reported by submit_payload
+        return []
+
+    entries = list(_iter_hrf_entries(data))
+    if not entries:
+        return [
+            "Could not find any HRF traces in this file — double-check it is "
+            "an HRF / montage JSON before submitting."
+        ]
+
+    flat: list[str] = []
+    no_sfreq: list[str] = []
+    single: list[str] = []
+    for name, entry in entries:
+        mean = entry.get("hrf_mean")
+        arr = (
+            np.asarray(mean, dtype=float)
+            if mean is not None else np.array([], dtype=float)
+        )
+        if (
+            arr.size == 0
+            or not np.any(np.isfinite(arr))
+            or float(np.nanstd(arr)) == 0.0
+        ):
+            flat.append(str(name))
+        sfreq = entry.get("sfreq")
+        try:
+            if sfreq is None or float(sfreq) <= 0:
+                no_sfreq.append(str(name))
+        except (TypeError, ValueError):
+            no_sfreq.append(str(name))
+        n_est = len(entry.get("estimate_sources") or entry.get("estimates") or [])
+        if n_est < 2:
+            single.append(str(name))
+
+    warnings: list[str] = []
+
+    def _summ(items: list[str], label: str) -> None:
+        if not items:
+            return
+        shown = ", ".join(items[:3]) + ("…" if len(items) > 3 else "")
+        warnings.append(f"{len(items)} HRF(s) {label} ({shown}).")
+
+    _summ(flat, "have a flat / degenerate mean trace")
+    _summ(no_sfreq, "are missing a valid sampling frequency")
+    _summ(
+        single,
+        "are built from fewer than 2 subject estimates "
+        "(no between-subject variability)",
+    )
+    return warnings
+
+
 def submit_payload(
     *,
     payload_path: Path,
@@ -684,6 +774,37 @@ def render_submission_panel(state, *, default_path: Optional[Path] = None) -> No
                         type="negative",
                     )
                     return
+
+                # Scientific pre-flight: warn (don't hard-block) when the
+                # payload looks degenerate / under-powered so a weak HRF
+                # doesn't silently enter the shared library. The user can
+                # still proceed deliberately.
+                quality_warnings = inspect_payload_quality(file_state["path"])
+                if quality_warnings:
+                    with ui.dialog() as _qdlg, ui.card():
+                        ui.label("Check before submitting").classes(
+                            "text-lg font-bold"
+                        )
+                        ui.label(
+                            "This HRF file has potential quality issues:"
+                        ).classes("text-sm")
+                        for _w in quality_warnings:
+                            ui.label(f"• {_w}").classes(
+                                "text-sm text-amber-800"
+                            )
+                        ui.label(
+                            "Submit it to the shared library anyway?"
+                        ).classes("text-sm q-mt-sm")
+                        with ui.row().classes("justify-end w-full"):
+                            ui.button(
+                                "Cancel", on_click=lambda: _qdlg.submit(False)
+                            ).props("flat")
+                            ui.button(
+                                "Submit anyway",
+                                on_click=lambda: _qdlg.submit(True),
+                            ).props("color=warning")
+                    if not await _qdlg:
+                        return
 
                 ui.notify("Uploading…", type="info")
 

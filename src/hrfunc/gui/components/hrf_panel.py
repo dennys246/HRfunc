@@ -54,6 +54,7 @@ import base64
 import io
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import numpy as np
@@ -75,6 +76,7 @@ from ..workers import (
     client_scope,
     make_progress_callback,
     notify_if_alive,
+    render_bulk_cancel_button,
     run_bulk_in_background,
     run_in_background,
     summarize_failures,
@@ -195,10 +197,20 @@ def _maybe_automatch_events(
     # Verbose: announce the auto-match (this fires once per scan — the match
     # is memoized — so it isn't spammy). The not-found case is conveyed by
     # the status banner ("scan annotations · none loaded from file").
-    ui.notify(
-        f"Auto-matched events: {found.name} ({_events_summary(parsed)}).",
-        type="positive",
-    )
+    #
+    # The toast is incidental FEEDBACK — the auto-match data work above is the
+    # real behaviour. ``ui.notify`` requires an active UI slot, and this
+    # function can run outside one (a unit test, or any non-render caller),
+    # where it would raise "slot stack ... is empty" and abort the match that
+    # already succeeded. Make the toast best-effort so it can never break the
+    # data flow.
+    try:
+        ui.notify(
+            f"Auto-matched events: {found.name} ({_events_summary(parsed)}).",
+            type="positive",
+        )
+    except RuntimeError:
+        logger.debug("auto-match toast skipped: no active UI slot")
 
 
 def _events_summary(parsed) -> str:
@@ -511,10 +523,23 @@ def _build_project_montage(sourced_montages: list):
         return None
 
     group = copy.deepcopy(real[0][1])
+    # Strip any per-scan 'global_*' aggregate nodes the base carries in.
+    # Each subject montage already ran generate_distribution, which
+    # synthesises global_hbo/global_hbr channels that hold a single estimate
+    # (that subject's own grand mean). If those survive into the pool, the
+    # final generate_distribution sees their non-empty ``estimates`` and
+    # treats them as real channels -- folding a "global of globals" back
+    # into the group mean and deflating the between-subject std. Drop them
+    # and let the final generate_distribution rebuild the globals cleanly
+    # from the real channels only.
+    for ch in [c for c in group.channels if "global" in c]:
+        del group.channels[ch]
     # Union of channels: graft in any channel present in a later subject but
     # absent from the base (heterogeneous montage layouts across subjects).
     for _sid, m in real[1:]:
         for ch, node in getattr(m, "channels", {}).items():
+            if "global" in ch:
+                continue  # globals are rebuilt below, never pooled
             if ch not in group.channels:
                 group.channels[ch] = copy.deepcopy(node)
     # Pool every subject's estimate into each channel, tagged by source.
@@ -737,6 +762,23 @@ def _render_preview_column(
             _render_edge_qc(state.project_montage, opts)
             _render_toeplitz_gallery(state, state.project_montage)
             return
+
+    # Upstream nudge: estimated-HRF Neural Activity deconvolution needs a
+    # GROUP montage (≥2 subjects). After a single subject, surface that here
+    # so the user isn't blindsided by a disabled Run on the Activity tab.
+    if (
+        n_subjects == 1
+        and state.montage is not None
+        and not isinstance(state.montage, _CanonicalResult)
+    ):
+        with ui.row().classes("items-center gap-2"):
+            ui.icon("groups", size="sm").classes("text-blue-600")
+            ui.label(
+                "1 subject estimated. Estimate HRFs for at least one more "
+                "subject to build the GROUP HRFs that Neural Activity "
+                "deconvolution uses — a single subject has no between-subject "
+                "variability. (Canonical / HRtree sources work with one scan.)"
+            ).classes("text-xs text-blue-800")
 
     preview_scan = scan if not bulk_mode else state.montage_source_scan
     if state.montage is None or preview_scan is None:
@@ -1033,8 +1075,18 @@ async def _open_events_dialog(
         _results.refresh()
         _preview.refresh()
 
-    def _search() -> None:
-        sel["results"] = find_event_files(root, sel["pattern"]) if root else []
+    async def _search(_e=None) -> None:
+        # find_event_files walks the whole project tree; run it off the event
+        # loop so a large dataset doesn't freeze the UI during the search.
+        if root:
+            import asyncio
+
+            loop = asyncio.get_event_loop()
+            sel["results"] = await loop.run_in_executor(
+                None, find_event_files, root, sel["pattern"]
+            )
+        else:
+            sel["results"] = []
         _results.refresh()
 
     with ui.dialog() as dialog, ui.card().classes("w-[640px] max-w-full gap-2"):
@@ -1049,7 +1101,9 @@ async def _open_events_dialog(
                 placeholder="filter, e.g. events*  or  *.tsv  (blank = all)",
                 on_change=lambda e: sel.__setitem__("pattern", e.value or ""),
             ).props("dense outlined").classes("flex-1").on(
-                "keydown.enter", lambda e: _search()
+                # Pass the coroutine directly — a sync lambda wrapping the
+                # async _search would return an un-awaited coroutine (no-op).
+                "keydown.enter", _search
             )
             ui.button("Search", icon="search", on_click=_search).props("flat dense")
 
@@ -1424,7 +1478,10 @@ def _render_toeplitz_global_params(opts: EstimationOptions) -> None:
     )
 
     def _on_lmbda_change(event) -> None:
-        log_val = int(event.value)
+        try:
+            log_val = int(event.value)
+        except (TypeError, ValueError):
+            return  # ignore a None/NaN slider payload rather than crash
         opts.lmbda = float(10 ** log_val)
         lmbda_display.set_text(f"lambda = {opts.lmbda:.0e}")
 
@@ -1553,6 +1610,15 @@ def _render_canonical_note() -> None:
         "~6 s, undershoot at ~16 s) — a fixed reference shape, not "
         "data-driven. Click Generate to display."
     ).classes("text-sm opacity-70")
+    # Set expectations: canonical results are a reference shape only. They are
+    # NOT cached as subject montages, so they do not build the project GROUP
+    # montage that Neural Activity's "Estimated HRFs" source uses. Switch to
+    # toeplitz mode to contribute a subject.
+    ui.label(
+        "Note: canonical HRFs are a reference shape only — they don't count "
+        "as a subject toward the group montage. Use toeplitz mode to "
+        "estimate data-driven HRFs that build the group."
+    ).classes("text-xs opacity-60 italic")
 
 
 def _render_run_row(
@@ -1659,6 +1725,7 @@ def _render_busy_progress(state: AppState) -> None:
                     f"  Channel {current + 1}/{total_ch}: {name}"
                 ).classes("text-xs opacity-60")
                 ui.linear_progress(value=fraction).classes("w-64")
+            render_bulk_cancel_button(state)
         return
 
     prog = state.estimation_progress
@@ -1728,6 +1795,8 @@ def _run_bulk(
         selected_events=opts.selected_events,
         timeout=opts.timeout,
         edge_expansion=opts.edge_expansion,
+        edge_std_frac=opts.edge_std_frac,
+        edge_std_ratio=opts.edge_std_ratio,
     )
 
     def _build(scan: ScanEntry):
@@ -1765,6 +1834,8 @@ def _run_bulk(
                     selected_events=selected,
                     timeout=snapshot.timeout,
                     edge_expansion=snapshot.edge_expansion,
+                    edge_std_frac=snapshot.edge_std_frac,
+                    edge_std_ratio=snapshot.edge_std_ratio,
                 )
                 return run_toeplitz_sync(
                     raw, scan_opts, progress_cb, event_rows, event_impulse
@@ -1852,6 +1923,8 @@ def _run(
         selected_events=opts.selected_events,
         timeout=opts.timeout,
         edge_expansion=opts.edge_expansion,
+        edge_std_frac=opts.edge_std_frac,
+        edge_std_ratio=opts.edge_std_ratio,
     )
 
     if snapshot.model == MODEL_TOEPLITZ:
@@ -1893,6 +1966,15 @@ def _run(
 
     async def _on_done(result) -> None:
         if result is None:
+            # Estimation yielded nothing. Surface feedback rather than leaving
+            # the previous scan's montage on screen as if this one succeeded.
+            # Preserve a worker-recorded exception message if present.
+            if not state.last_error:
+                state.last_error = (
+                    "HRF estimation produced no output for this scan — check "
+                    "the events selection and that the scan is "
+                    "deconvolution-preprocessed."
+                )
             return
         state.montage = result
         # Track which scan produced this montage so the Activity tab can

@@ -50,6 +50,7 @@ from ..workers import (
     client_scope,
     make_progress_callback,
     notify_if_alive,
+    render_bulk_cancel_button,
     run_bulk_in_background,
     run_in_background,
     summarize_failures,
@@ -320,6 +321,23 @@ def _render_body(state: AppState, opts: ActivityOptions) -> None:
                 _render_hrf_source_column(state, scan, opts, bulk_mode)
 
 
+def _has_current_result(state: AppState, scan: Optional[ScanEntry]) -> bool:
+    """True only when the in-memory deconvolution belongs to THIS scan.
+
+    ``activity_raw`` is a single global slot that is NOT cleared on scan
+    change, so gating Save on it alone lets the user write scan A's
+    deconvolution under scan B's filename (with a dropped-channel count
+    computed against B). Match the same ``activity_source_scan`` predicate the
+    preview overlay already uses so Save only offers the current scan's result.
+    """
+    return (
+        state.activity_raw is not None
+        and scan is not None
+        and state.activity_source_scan is not None
+        and state.activity_source_scan.path == scan.path
+    )
+
+
 def _can_save(
     state: AppState,
     scan: Optional[ScanEntry],
@@ -327,7 +345,7 @@ def _can_save(
 ) -> bool:
     """Whether a Save action is available: an in-memory result for the current
     scan, or one or more checked scans to estimate-and-save in bulk."""
-    has_current = state.activity_raw is not None and scan is not None
+    has_current = _has_current_result(state, scan)
     can_mass = len(checked_scans) >= 1
     return has_current or can_mass
 
@@ -379,7 +397,7 @@ def _render_save_button(
     scan. When checked scans exist but none have been estimated yet, the button
     is disabled with a hint. Filename postfix / format come from ``naming``.
     """
-    has_current = state.activity_raw is not None and scan is not None
+    has_current = _has_current_result(state, scan)
     bulk_mode = len(checked_scans) >= 1
 
     if bulk_mode:
@@ -599,6 +617,19 @@ def _render_library_per_channel_status(
         min=1.0, max=200.0, step=1.0, format="%.0f",
         on_change=lambda e: _set_radius(e.value),
     ).props("dense").classes("w-40")
+    # Scientific framing: a channel should match an HRF from the SAME
+    # functional region. ~10-25 mm keeps matches local; a wide radius pools
+    # HRFs across distinct cortical regions (and across the head->MNI
+    # coord-frame offset), blurring region-specific responses.
+    if opts.library_radius_mm > 30.0:
+        ui.label(
+            f"⚠ {opts.library_radius_mm:.0f} mm is wide — it may match HRFs "
+            "from functionally distinct regions. ~10–25 mm is typical."
+        ).classes("text-xs text-amber-700")
+    else:
+        ui.label(
+            "Typical: ~10–25 mm (keeps matches within a functional region)."
+        ).classes("text-xs opacity-50")
 
     # ── Uncovered-channel handling (lives here in the right column, per the
     # request). Default 'skip' fails loudly; user can switch to canonical.
@@ -802,6 +833,18 @@ def _render_canonical_source_status(
         "from the bundled library. No estimation needed; works on every scan."
     ).classes("text-sm opacity-70")
 
+    # Nudge toward the validated, subject-specific group HRFs when they exist:
+    # a generic fixed shape is a downgrade from the project's own estimates.
+    if _group_subject_count(state) >= 2:
+        with ui.row().classes("items-center gap-2 q-mt-xs"):
+            ui.icon("lightbulb", size="sm").classes("text-amber-600")
+            ui.label(
+                f"You have estimated GROUP HRFs from "
+                f"{_group_subject_count(state)} subjects — those are "
+                "subject-specific and preferred over this generic shape. "
+                "Switch the source to \"Estimated HRFs\" to use them."
+            ).classes("text-xs text-amber-800")
+
     try:
         from .hrf_panel import (
             _CanonicalResult as _CR,
@@ -852,7 +895,10 @@ def _render_lmbda_slider(opts: ActivityOptions) -> None:
     )
 
     def _on_change(event) -> None:
-        log_val = int(event.value)
+        try:
+            log_val = int(event.value)
+        except (TypeError, ValueError):
+            return  # ignore a None/NaN slider payload rather than crash
         opts.lmbda = float(10 ** log_val)
         lmbda_display.set_text(f"lambda = {opts.lmbda:.0e}")
 
@@ -918,12 +964,24 @@ def _render_run_row(
     (filename options come from the Deconvolution card via ``naming``).
     """
     bulk_mode = bool(checked)
+    bulk_block_reason: Optional[str] = None
     if bulk_mode:
         run_label = (
             f"Estimate activity for {len(checked)} scan"
             f"{'s' if len(checked) != 1 else ''}"
         )
         can_run = not state.busy
+        # Bulk toeplitz (estimated-HRF) deconvolution needs the project GROUP
+        # montage. With fewer than 2 estimated subjects, _montage_for_scan
+        # returns None for every scan and the whole batch would be skipped --
+        # block the run with a clear reason instead of failing N scans.
+        if opts.hrf_model == MODEL_TOEPLITZ and _group_subject_count(state) < 2:
+            can_run = False
+            bulk_block_reason = (
+                "Estimated-HRF deconvolution needs GROUP HRFs from ≥2 "
+                "subjects. Estimate HRFs for more scans on the HRFs tab, or "
+                "switch the source to Canonical / HRtree."
+            )
     else:
         # Activity deconvolution must run on deconvolution-preprocessed data
         # (not the GLM/haemoglobin pipeline), so require the scan to be in
@@ -959,6 +1017,11 @@ def _render_run_row(
 
         # Save sits on the same horizontal level as Estimate.
         _render_save_button(state, scan, checked, naming)
+
+        if bulk_block_reason and not state.busy:
+            with ui.row().classes("items-center gap-2"):
+                ui.icon("info").classes("text-amber-500")
+                ui.label(bulk_block_reason).classes("text-sm opacity-70")
 
         if state.busy:
             _render_busy_progress(state)
@@ -1017,6 +1080,7 @@ def _render_busy_progress(state: AppState) -> None:
                     f"  Channel {current + 1}/{total_ch}: {name}"
                 ).classes("text-xs opacity-60")
                 ui.linear_progress(value=fraction).classes("w-64")
+            render_bulk_cancel_button(state)
         return
 
     prog = state.estimation_progress
@@ -1048,10 +1112,18 @@ def _run_dispatch(
 
 
 def _group_subject_count(state: AppState) -> int:
-    """Number of scans pooled into the group montage (non-canonical cache)."""
+    """Number of scans actually pooled into the group montage.
+
+    Must mirror ``hrf_panel._sourced_project_montages``: count non-canonical
+    cache entries EXCLUDING any the user removed from the group
+    (``project_group_excluded``). Counting raw ``montage_cache`` would overstate
+    the subject count after a removal and let the >=2 gate pass on a pool that
+    actually holds a single subject (whose between-subject std is 0).
+    """
     return sum(
-        1 for m in state.montage_cache.values()
+        1 for path, m in state.montage_cache.items()
         if m is not None and not isinstance(m, _CanonicalResult)
+        and path not in state.project_group_excluded
     )
 
 
@@ -1186,8 +1258,11 @@ def _run_bulk(
             )
         state.activity_raw = result
         # Cache per scan so channel-wise 3-stage QC can read each scan's
-        # deconvolution (activity_raw only holds the most-recent one).
-        state.activity_cache._cache[scan.path.resolve()] = result
+        # deconvolution (activity_raw only holds the most-recent one). Route
+        # through ``put`` rather than poking ``_cache`` directly -- the cache
+        # is unbounded (maxsize=None) so nothing is evicted, and going via
+        # the API keeps key normalisation in one place.
+        state.activity_cache.put(scan, result)
         # Track which scan produced activity_raw so the preview won't overlay
         # one scan's deconvolution against another's preprocessed Raw.
         state.activity_source_scan = scan
@@ -1222,20 +1297,45 @@ def _run_bulk(
     background_tasks.create(_bulk())
 
 
+def _resolve_save_targets(scans, folder, postfix, ext) -> "dict":
+    """Output path per scan for a mass activity save (pure / testable).
+
+    ``folder=None`` → colocated next to each source file. A folder → flat
+    destination, with name-collision disambiguation (``_2``, ``_3``, …) so two
+    sources sharing a stem don't clobber each other in the same folder.
+    """
+    out: dict = {}
+    seen: set = set()
+    for s in scans:
+        base = folder if folder is not None else s.path.parent
+        stem = f"{s.path.stem}{postfix}"
+        path = base / f"{stem}{ext}"
+        if folder is not None:
+            i = 2
+            while path.resolve() in seen:
+                path = base / f"{stem}_{i}{ext}"
+                i += 1
+        seen.add(path.resolve())
+        out[s] = path
+    return out
+
+
 async def _mass_save_activity(
     state: AppState,
     scans: List[ScanEntry],
     naming: dict,
 ) -> None:
-    """Save the ALREADY-estimated activity for each scan, colocated with its
-    source file.
+    """Save the ALREADY-estimated activity for each scan.
 
-    For a batch there's no file dialog: each deconvolved scan is written into
-    the SAME folder as its source as ``<stem><postfix><ext>``, after a single
-    confirmation showing the filename format and how many scans will be saved.
-    Save is independent of Estimate — it writes each scan's cached
-    deconvolution (``state.activity_cache``) and never re-estimates; scans
-    with no cached result are skipped with a clear "not estimated yet" reason.
+    A single confirmation dialog shows the filename format and lets the user
+    pick the destination: colocated next to each source file (default,
+    ``<stem><postfix><ext>``) or a single chosen folder — the latter so a
+    READ-ONLY source directory doesn't dead-end the save. In a flat folder,
+    colliding output names are disambiguated (``_2``, ``_3``, …). Save is
+    independent of Estimate — it writes each scan's cached deconvolution
+    (``state.activity_cache``) and never re-estimates; scans with no cached
+    result are skipped with a clear "not estimated yet" reason, and a scan
+    whose target would overwrite its own source file is skipped too.
     Continue-on-error with a final summary toast.
     """
     if state.busy:
@@ -1245,20 +1345,81 @@ async def _mass_save_activity(
     postfix = naming.get("postfix", "_deconvolved")
     ext = naming.get("ext", ".snirf")
     n = len(scans)
-    example = f"{scans[0].path.stem}{postfix}{ext}" if scans else f"<scan>{postfix}{ext}"
 
-    # Confirm rather than open a file dialog: each scan saves next to its
-    # source (colocated), so there's no destination to pick.
-    with ui.dialog() as dialog, ui.card().classes("gap-2"):
-        ui.label("Save deconvolved scans").classes("text-base font-semibold")
-        ui.label(
-            f"{n} deconvolved scan{'s' if n != 1 else ''} will be saved next "
-            "to each source file (same folder)."
-        ).classes("text-sm")
+    # Destination: None = colocated (next to each source file); a Path = a
+    # single chosen folder (flat). The chosen-folder option lets the user save
+    # off a READ-ONLY source directory (e.g. a shared/mounted dataset) instead
+    # of being stuck when every colocated write fails.
+    dest: dict = {"folder": None}
+
+    def _resolve_outputs() -> "dict":
+        return _resolve_save_targets(scans, dest["folder"], postfix, ext)
+
+    @ui.refreshable
+    def _dest_section() -> None:
+        outputs = _resolve_outputs()
+        colocated = dest["folder"] is None
+        # Source-clobber only happens colocated (empty postfix + same ext).
+        clobber_source = [
+            s for s in scans if outputs[s].resolve() == s.path.resolve()
+        ]
+        existing = [
+            s for s in scans
+            if s not in clobber_source and outputs[s].exists()
+        ]
+        if colocated:
+            ui.label(
+                f"{n} deconvolved scan{'s' if n != 1 else ''} will be saved "
+                "next to each source file (same folder)."
+            ).classes("text-sm")
+        else:
+            ui.label(
+                f"{n} deconvolved scan{'s' if n != 1 else ''} will be saved "
+                "to this folder:"
+            ).classes("text-sm")
+            ui.label(str(dest["folder"])).classes(
+                "text-xs font-mono opacity-70 break-all"
+            )
         ui.label(f"Filename format:  <scan>{postfix}{ext}").classes(
             "text-xs font-mono opacity-70"
         )
-        ui.label(f"e.g.  {example}").classes("text-xs font-mono opacity-50")
+        if existing:
+            ui.label(
+                f"⚠ {len(existing)} file(s) already exist and will be "
+                "OVERWRITTEN."
+            ).classes("text-xs text-amber-700")
+        if clobber_source:
+            ui.label(
+                f"⚠ {len(clobber_source)} would write over the SOURCE scan "
+                "(empty postfix + same format) — these will be SKIPPED. Set a "
+                "filename postfix, or choose a different folder."
+            ).classes("text-xs text-red-700")
+
+    async def _choose_folder() -> None:
+        from .dataset_picker import pick_folder
+
+        picked = await pick_folder()
+        if picked is not None:
+            dest["folder"] = picked
+            _dest_section.refresh()
+
+    def _use_colocated() -> None:
+        dest["folder"] = None
+        _dest_section.refresh()
+
+    with ui.dialog() as dialog, ui.card().classes("gap-2 w-[540px] max-w-full"):
+        ui.label("Save deconvolved scans").classes("text-base font-semibold")
+        _dest_section()
+        with ui.row().classes("items-center gap-2"):
+            ui.button(
+                "Choose folder…", icon="folder_open", on_click=_choose_folder,
+            ).props("flat dense").tooltip(
+                "Save the whole batch into one folder — use this when the "
+                "source folder is read-only."
+            )
+            ui.button(
+                "Next to each source", icon="restore", on_click=_use_colocated,
+            ).props("flat dense")
         with ui.row().classes("justify-end gap-2 w-full"):
             ui.button("Cancel", on_click=lambda: dialog.submit(False)).props("flat")
             ui.button("Save", icon="save", on_click=lambda: dialog.submit(True)).props(
@@ -1268,6 +1429,9 @@ async def _mass_save_activity(
     if not confirmed:
         return
 
+    # Freeze the destination mapping at confirm time.
+    outputs = _resolve_outputs()
+
     def _build(scan: ScanEntry):
         # Save only — never estimate. Skip scans that haven't been run yet.
         if scan not in state.activity_cache:
@@ -1276,11 +1440,18 @@ async def _mass_save_activity(
                 "re-estimate)"
             )
         result = state.activity_cache.get(scan)
-        # Colocated: write next to the source scan.
-        out_path = scan.path.parent / f"{scan.path.stem}{postfix}{ext}"
+        out_path = outputs[scan]
+        # Never overwrite the SOURCE file (empty postfix + same extension) —
+        # that would destroy the raw recording. Skip with a clear reason.
+        if out_path.resolve() == scan.path.resolve():
+            return (
+                "would overwrite the source file — set a filename postfix to "
+                "save the deconvolution separately"
+            )
 
         def _save_only(result=result, out_path=out_path):
             try:
+                out_path.parent.mkdir(parents=True, exist_ok=True)
                 _save_raw(result, out_path)
             except Exception as exc:  # noqa: BLE001 — disk/format failure
                 raise RuntimeError(
@@ -1302,9 +1473,12 @@ async def _mass_save_activity(
             return
         successes, failures = bulk_result
         n_ok, n_fail = len(successes), len(failures)
+        where = (
+            f"to {dest['folder']}" if dest["folder"] is not None
+            else "next to their source files"
+        )
         summary = (
-            f"Saved {n_ok}/{n_ok + n_fail} deconvolved scan(s) next to their "
-            "source files."
+            f"Saved {n_ok}/{n_ok + n_fail} deconvolved scan(s) {where}."
         )
         if failures:
             summary += f" Failed/skipped: {summarize_failures(failures)}"
@@ -1373,11 +1547,24 @@ def _run(
 
     async def _on_done(result) -> None:
         if result is None:
+            # The estimate produced nothing (every channel dropped, or no
+            # deconvolvable data). Don't silently leave the PREVIOUS scan's
+            # result on screen implying this one succeeded — surface an error.
+            # Only set it if the worker didn't already record an exception
+            # message, so a real traceback isn't overwritten.
+            if not state.last_error:
+                state.last_error = (
+                    "Deconvolution produced no output for this scan — every "
+                    "channel may have been dropped (check the scan's HRFs and "
+                    "preprocessing)."
+                )
             return
         state.activity_raw = result
         # Cache per scan so channel-wise 3-stage QC can read this scan's
         # deconvolution later (activity_raw only holds the most-recent one).
-        state.activity_cache._cache[scan.path.resolve()] = result
+        # ``put`` on the unbounded (maxsize=None) cache: no eviction, one
+        # place for key normalisation.
+        state.activity_cache.put(scan, result)
         # Track which scan produced activity_raw (preview gate uses it).
         state.activity_source_scan = scan
         state.publish("activity_estimated", scan)

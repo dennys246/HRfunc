@@ -119,6 +119,17 @@ def _render_body(state: AppState) -> None:
     with ui.column().classes("p-6 gap-4 w-full"):
         ui.label("Quality").classes("text-2xl font-semibold")
 
+        # The dataset-tree checkboxes drive BULK actions on the Preprocess /
+        # HRFs / Neural Activity tabs only. Quality works on the selected scan
+        # plus the dataset-wide aggregate, so a checked selection has no effect
+        # here -- say so when one exists to avoid silent confusion.
+        if state.checked_scan_paths:
+            ui.label(
+                f"Note: the {len(state.checked_scan_paths)} checked scan(s) "
+                "drive bulk actions on other tabs. Quality reports on the "
+                "selected scan and the whole dataset, not the checked set."
+            ).classes("text-xs opacity-60 italic")
+
         scan = state.selected_scan
         if scan is None and not state.quality_metrics:
             ui.label("Select a scan from the dataset tree.").classes(
@@ -766,13 +777,23 @@ def _compute_signal_metrics(raw: "mne.io.BaseRaw") -> QualityMetrics:
 
 
 def _nanmean_or_none(by_channel: Optional[Dict[str, float]]) -> Optional[float]:
-    """Mean of a by-channel dict's values, or None when absent/empty."""
+    """Mean of a by-channel dict's values, or None when absent/empty.
+
+    Drops both ``None`` and ``NaN`` values: a channel can yield a real NaN
+    metric (e.g. a flat/zero-variance channel), and ``np.nanmean`` over a
+    list that is *all* NaN both emits a RuntimeWarning and returns NaN rather
+    than the None this is meant to produce. Filtering NaN first means an
+    all-NaN (or all-None) input cleanly returns None.
+    """
     if not by_channel:
         return None
-    vals = [v for v in by_channel.values() if v is not None]
+    vals = [
+        v for v in by_channel.values()
+        if v is not None and not np.isnan(v)
+    ]
     if not vals:
         return None
-    return float(np.nanmean(vals))
+    return float(np.mean(vals))
 
 
 def _compute_raw_metrics(raw: "mne.io.BaseRaw") -> QualityMetrics:
