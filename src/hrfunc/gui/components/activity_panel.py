@@ -761,99 +761,35 @@ def _render_estimated_source_status(
 ) -> None:
     """Status + preview for the "Estimated HRFs" (toeplitz) source.
 
-    HRFs are cached per scan (``state.montage_cache``), so each scan is
-    deconvolved with its OWN HRFs — single or bulk. Reports this scan's
-    readiness (single mode) or a batch summary (bulk mode).
-
-    When a pooled group montage exists (≥2 subjects estimated on the HRFs
-    tab), a toggle lets the user deconvolve every scan with the GROUP HRFs
-    instead — matched by channel name, so it also covers scans that weren't
-    individually estimated.
+    Deconvolution with estimated HRFs uses the GROUP montage — the >=2-subject
+    pool built on the HRFs tab — matched by channel name. Deconvolving a scan
+    with its OWN single-subject HRFs is intentionally NOT offered (not
+    validated/recommended in the paper). With fewer than two estimated
+    subjects there's no group, so we point the user at the HRtree library or
+    canonical source instead.
     """
-    n_group = _group_subject_count(state)
-    group_available = (
-        state.project_montage is not None
-        and not isinstance(state.project_montage, _CanonicalResult)
-        and n_group >= 2
-    )
-    if group_available:
-        def _set_group(event) -> None:
-            state.activity_use_group_hrfs = bool(event.value)
-            state.publish("scan_selected", state.selected_scan)
-
-        ui.radio(
-            {False: "Each scan's own HRFs", True: f"Group HRFs ({n_group})"},
-            value=state.activity_use_group_hrfs,
-            on_change=_set_group,
-        ).props("inline dense").classes("text-xs")
-    elif state.activity_use_group_hrfs:
-        # Group montage went away (project reset / re-estimate) — fall back.
-        state.activity_use_group_hrfs = False
-
-    if state.activity_use_group_hrfs and group_available:
+    montage = _montage_for_scan(state, scan)  # group (>=2 subjects) or None
+    if montage is not None:
+        n_group = _group_subject_count(state)
         ui.label(
             f"Deconvolving every scan with the GROUP HRFs ({n_group} subjects), "
             "matched by channel name."
         ).classes("text-sm opacity-70")
-        _safe_render_gallery(state, state.project_montage)
-        return
-
-    if bulk_mode:
-        n_cached = len(state.montage_cache)
-        ui.label(
-            "Each checked scan is deconvolved with its own estimated HRFs. "
-            f"{n_cached} scan(s) currently have estimated HRFs; checked scans "
-            "without them are skipped — estimate HRFs for them first."
-        ).classes("text-xs opacity-70 italic")
-        if n_cached == 0:
-            _go_to_hrfs_button(state)
-        montage = _montage_for_scan(state, scan)
-        if montage is not None:
-            _safe_render_gallery(state, montage)
-        return
-
-    montage = _montage_for_scan(state, scan)
-    if montage is not None:
-        ui.label("Using HRFs estimated for this scan.").classes(
-            "text-sm opacity-70"
-        )
         _safe_render_gallery(state, montage)
         return
 
-    # Not ready for this scan — tailor the message.
-    if isinstance(state.montage, _CanonicalResult) and not state.montage_cache:
-        ui.label(
-            "Toeplitz mode requires real per-channel HRFs, but the HRFs tab "
-            "last produced a canonical reference shape."
-        ).classes("text-sm opacity-70")
-        ui.label(
-            "Re-run the HRFs tab in toeplitz mode, or switch the source above "
-            "to canonical."
-        ).classes("text-xs opacity-60")
-        _go_to_hrfs_button(state)
-        return
-
-    any_estimated = bool(state.montage_cache) or (
-        state.montage is not None
-        and not isinstance(state.montage, _CanonicalResult)
-    )
-    if not any_estimated:
-        ui.label(
-            "Toeplitz mode requires estimated HRFs — none have been estimated "
-            "yet."
-        ).classes("text-sm opacity-70")
-        ui.label(
-            "Estimate per-channel HRFs first, then return here to deconvolve "
-            "activity with them."
-        ).classes("text-xs opacity-60")
-    else:
-        ui.label(
-            "No estimated HRFs for this scan."
-        ).classes("text-sm opacity-70")
-        ui.label(
-            "Estimate HRFs for this scan (toeplitz), or switch the source "
-            "above to canonical."
-        ).classes("text-xs opacity-60")
+    # Not enough subjects for a validated group HRF.
+    ui.label(
+        "Estimated-HRF deconvolution uses a GROUP HRF — the average across "
+        "≥2 subjects' estimates. Deconvolving a scan with its own HRFs isn't "
+        "offered (not validated in the paper)."
+    ).classes("text-sm opacity-70")
+    n_cached = _group_subject_count(state)
+    ui.label(
+        f"{n_cached} scan{'s' if n_cached != 1 else ''} estimated so far — "
+        "estimate HRFs for at least 2 on the HRFs tab, or switch the source "
+        "above to the HRtree library or canonical."
+    ).classes("text-xs opacity-60")
     _go_to_hrfs_button(state)
 
 
@@ -1120,34 +1056,25 @@ def _group_subject_count(state: AppState) -> int:
 
 
 def _montage_for_scan(state: AppState, scan: Optional[ScanEntry]):
-    """The per-channel Montage to use for toeplitz activity on ``scan``.
+    """The per-channel Montage for toeplitz ("Estimated HRFs") activity.
 
-    Prefers the scan's own cached montage (``state.montage_cache``, populated
-    by every HRF estimate), so toeplitz works per-scan across single and bulk
-    runs. Falls back to the single most-recent ``state.montage`` when it was
-    estimated for this exact scan. Returns None when neither applies.
+    Deconvolution with estimated HRFs uses the GROUP montage — the pooled,
+    >=2-subject project montage (matched by channel name in estimate_activity).
+    Deconvolving a scan with its OWN single-subject HRFs is intentionally NOT
+    offered: it wasn't validated/recommended in the paper. With fewer than two
+    estimated subjects there is no group, so this returns None and the user is
+    pointed at the HRtree library or canonical sources instead.
+
+    ``scan`` is accepted for call-site compatibility but unused — the group
+    HRF applies to every scan by channel name.
     """
-    # Group mode: deconvolve EVERY scan with the pooled project montage
-    # (matched by channel name in estimate_activity), so a group HRF can be
-    # applied even to scans that weren't individually estimated.
+    group = state.project_montage
     if (
-        getattr(state, "activity_use_group_hrfs", False)
-        and state.project_montage is not None
-        and not isinstance(state.project_montage, _CanonicalResult)
+        group is not None
+        and not isinstance(group, _CanonicalResult)
+        and _group_subject_count(state) >= 2
     ):
-        return state.project_montage
-    if scan is None:
-        return None
-    cached = state.montage_cache.get(scan.path.resolve())
-    if cached is not None:
-        return cached
-    if (
-        state.montage is not None
-        and not isinstance(state.montage, _CanonicalResult)
-        and state.montage_source_scan is not None
-        and state.montage_source_scan.path == scan.path
-    ):
-        return state.montage
+        return group
     return None
 
 

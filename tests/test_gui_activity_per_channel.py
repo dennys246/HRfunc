@@ -234,26 +234,29 @@ class TestActivityGroupMode:
         )
         assert activity_panel._group_subject_count(state) == 2
 
-    def test_montage_for_scan_returns_group_when_enabled(self, tmp_path):
+    def test_montage_for_scan_returns_group_with_two_subjects(self, tmp_path):
+        from pathlib import Path
         scan = ScanEntry(format="snirf", path=tmp_path / "x.snirf")
         state = AppState()
         group = object()  # stand-in non-canonical montage
         state.project_montage = group
-        state.activity_use_group_hrfs = True
-        # Scan was never individually estimated, yet group mode supplies HRFs.
+        state.montage_cache[Path("/a")] = object()
+        state.montage_cache[Path("/b")] = object()
+        # Group HRF applies to any scan (even one never individually estimated).
         assert activity_panel._montage_for_scan(state, scan) is group
 
-    def test_group_off_uses_scans_own_montage(self, tmp_path):
+    def test_montage_for_scan_none_with_single_subject(self, tmp_path):
+        # "A scan's own HRFs" is NOT offered — fewer than 2 subjects => no
+        # toeplitz montage (use library / canonical instead).
+        from pathlib import Path
         scan = ScanEntry(format="snirf", path=tmp_path / "x.snirf")
         state = AppState()
-        own = object()
-        state.montage_cache[scan.path.resolve()] = own
         state.project_montage = object()
-        state.activity_use_group_hrfs = False
-        assert activity_panel._montage_for_scan(state, scan) is own
+        state.montage_cache[Path("/a")] = object()  # only 1 subject
+        assert activity_panel._montage_for_scan(state, scan) is None
 
     @pytest.mark.asyncio
-    async def test_group_toggle_renders_when_two_subjects(self, user, tmp_path):
+    async def test_group_status_renders_with_two_subjects(self, user, tmp_path):
         from pathlib import Path
         state = AppState()
         state.montage_cache[Path("/a")] = object()
@@ -265,4 +268,18 @@ class TestActivityGroupMode:
             activity_panel._render_estimated_source_status(state, None, False)
 
         await user.open("/_agroup")
-        await user.should_see("Group HRFs (2)")
+        await user.should_see("GROUP HRFs (2 subjects)")
+
+    @pytest.mark.asyncio
+    async def test_prompts_when_fewer_than_two_subjects(self, user, tmp_path):
+        from pathlib import Path
+        state = AppState()
+        state.montage_cache[Path("/a")] = object()  # only 1 subject
+
+        @ui.page("/_agroup_one")
+        def _p() -> None:
+            activity_panel._render_estimated_source_status(state, None, False)
+
+        await user.open("/_agroup_one")
+        await user.should_see("average across ≥2 subjects")
+        await user.should_see("not validated in the paper")

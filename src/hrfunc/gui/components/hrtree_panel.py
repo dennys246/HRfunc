@@ -865,11 +865,11 @@ def _render_cluster_subtab(state: AppState) -> None:
             # Add ROI / Add Montage buttons), so there's no standalone
             # button here anymore.
 
-            # --- MNI + atlas readouts --------------------------------
+            # --- Atlas readout ---------------------------------------
+            # (The shape/MNI coords readout was removed — it just repeated the
+            # centre inputs + radius slider above. The atlas Region-at-centre
+            # stays as real, non-redundant provenance.)
             ui.separator()
-            ui.label(_format_shape_readout(state)).classes(
-                "text-xs font-mono opacity-80 break-all"
-            )
             if atlas is not None:
                 # Atlas readout is shown in BOTH modes so sphere users
                 # can see "my centre sits in: Frontal Pole" without
@@ -921,9 +921,11 @@ def _render_cluster_subtab(state: AppState) -> None:
                 alignment_affine=alignment,
             )
             roi_result = compute_roi_average(matched, roi_keys)
-            excluded_count = compute_roi_excluded_count(matched, roi_keys)
             can_save = roi_result is not None
 
+            # The "averaging N subjects across M channels" readout moved to the
+            # detail pane (right). Only the can't-save gate stays here so a
+            # disabled Save button still explains itself.
             if roi_result is None:
                 ui.label(
                     "Active ROI has fewer than 2 averageable subject "
@@ -932,19 +934,6 @@ def _render_cluster_subtab(state: AppState) -> None:
                     "centre. (Note: HRFs without per-subject estimates "
                     "are excluded.)"
                 ).classes("text-xs opacity-60 italic")
-            else:
-                _, _, n_subjects, n_channels = roi_result
-                ui.label(
-                    f"Active ROI: averaging {n_subjects} subject "
-                    f"estimates across {n_channels} channel"
-                    f"{'s' if n_channels != 1 else ''}."
-                ).classes("text-xs opacity-70")
-                if excluded_count > 0:
-                    ui.label(
-                        f"  ({excluded_count} HRF"
-                        f"{'s' if excluded_count != 1 else ''} excluded "
-                        f"for lacking subject-level estimates.)"
-                    ).classes("text-xs opacity-50 italic")
 
             # Visibility summary for the multi-ROI case so the user
             # knows the save button reflects fewer than the list shows.
