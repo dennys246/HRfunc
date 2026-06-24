@@ -570,6 +570,31 @@ SUBTAB_CLUSTER = "Cluster"
 SUBTAB_NAMES = (SUBTAB_FILTER, SUBTAB_CLUSTER)
 
 
+def _render_oxygenation_radio(state: AppState) -> None:
+    """HbO / HbR / Both oxygenation filter.
+
+    Rendered above the Filter / Cluster sub-tabs (not inside Filter) so it
+    applies to BOTH sub-tabs and stays changeable while viewing either. It
+    publishes ``hrtree_filter_changed`` so the viz, detail pane, ROI
+    membership, and per-channel deconvolution matching all re-scope to the
+    chosen oxygenation.
+    """
+
+    def _on_change(event) -> None:
+        state.library_oxygenation = event.value or "both"
+        state.publish("hrtree_filter_changed", state.library_filter)
+
+    with ui.row().classes("items-center gap-2 w-full"):
+        ui.label("Oxygenation").classes(
+            "text-xs uppercase opacity-60 tracking-wide"
+        )
+        ui.radio(
+            {"both": "Both", "hbo": "HbO only", "hbr": "HbR only"},
+            value=state.library_oxygenation,
+            on_change=_on_change,
+        ).props("inline dense")
+
+
 def _render_left_pane(state: AppState) -> None:
     """Wordmark + sub-tabs at the top, active sub-tab content below.
 
@@ -586,6 +611,12 @@ def _render_left_pane(state: AppState) -> None:
         ui.label(
             "3D spatial database of literature HRFs."
         ).classes("text-xs opacity-60")
+
+        # Oxygenation filter sits ABOVE the sub-tabs so it applies to both
+        # Filter and Cluster and stays changeable on either — it scopes
+        # everything downstream (visible HRFs, ROI membership, per-channel
+        # deconvolution matching), not just the Filter sub-tab.
+        _render_oxygenation_radio(state)
 
         # Sub-tabs.
         with ui.tabs().props("dense").classes("w-full") as subtabs:
@@ -623,20 +654,9 @@ def _render_filter_subtab(state: AppState) -> None:
     filtered. "Apply" then refreshes the dependent viz + detail panes.
     """
     with ui.column().classes("w-full gap-3"):
-        # -- Oxygenation radio (frequently toggled, top placement)
-
-        def _on_oxygenation_change(event) -> None:
-            state.library_oxygenation = event.value or "both"
-            state.publish("hrtree_filter_changed", state.library_filter)
-
-        ui.radio(
-            {"both": "Both", "hbo": "HbO only", "hbr": "HbR only"},
-            value=state.library_oxygenation,
-            on_change=_on_oxygenation_change,
-        ).props("inline dense")
-
-        # ── Context inputs (set-once / refine-slowly)
-        ui.separator()
+        # ── Context inputs (set-once / refine-slowly). The oxygenation radio
+        # moved up to the left pane (above the sub-tabs) so it applies to both
+        # Filter and Cluster.
         inputs: Dict[str, Any] = {}
         for field in FILTER_FIELDS:
             initial = str(state.library_filter.get(field, ""))
@@ -2127,6 +2147,11 @@ def _render_detail_pane(state: AppState) -> None:
             ui.label("Detail").classes(
                 "text-xs uppercase opacity-60 tracking-wide"
             )
+            # When an ROI is the current selection, lead with the ROI's
+            # aggregate HRF (its averaged trace) instead of a single anchor
+            # HRF — that's the thing the user picked.
+            if _showing_active_roi(state) and _render_active_roi_detail(state):
+                return
             if hrf is None:
                 ui.label("Click an HRF in the viz to inspect.").classes(
                     "text-sm opacity-60"
@@ -2194,6 +2219,80 @@ def _render_detail_pane(state: AppState) -> None:
     # viz already listens there; the detail pane needs to refresh too
     # so the ROI-average plot updates when the user widens the radius.
     state.subscribe("hrtree_filter_changed", _refresh_detail)
+
+
+def _showing_active_roi(state: AppState) -> bool:
+    """True when the detail pane should lead with the active ROI's HRF.
+
+    The user "selected an ROI" (vs. clicking a lone HRF) when the current
+    selection IS that ROI's own anchor object — selecting a slot re-seeds
+    ``library_selected_hrf = active.anchor`` (same identity). An anchorless
+    shape ROI selects with ``library_selected_hrf = None`` while still having
+    members, so a ``None`` selection with an active ROI also counts. Clicking
+    a different individual HRF makes a fresh dict, so identity differs and the
+    single-HRF detail shows instead.
+    """
+    active = state.active_roi
+    if active is None:
+        return False
+    sel = state.library_selected_hrf
+    return sel is None or sel is active.anchor
+
+
+def _render_active_roi_detail(state: AppState) -> bool:
+    """Render the active ROI's aggregate HRF as the primary detail.
+
+    Returns True when it rendered (the ROI has an averageable HRF), False when
+    there's nothing to show — the caller then falls back to the single-HRF
+    detail. Mirrors :func:`_render_roi_average`'s membership computation but
+    leads with ROI-level metadata (name, member/pool counts) instead of a
+    single optode's location/context.
+    """
+    active = state.active_roi
+    if active is None:
+        return False
+    all_hrfs = gather_library_hrfs(state)
+    matched = filter_by_oxygenation(
+        apply_filter(all_hrfs, state.library_filter),
+        state.library_oxygenation,
+    )
+    shape = _build_current_shape(state)
+    oxy_filter = _resolve_cluster_oxygenation(state)
+    alignment = _alignment_for_shape(state, shape)
+    roi_keys = compute_roi_keys_by_shape(
+        matched, shape, state.library_roi_painted,
+        oxygenation_filter=oxy_filter,
+        alignment_affine=alignment,
+    )
+    result = compute_roi_average(matched, roi_keys)
+    if result is None:
+        return False
+    mean, std, n_subjects, n_channels = result
+    anchor = state.library_selected_hrf
+    sfreq = _resolve_roi_sfreq(anchor, matched, roi_keys)
+
+    name = getattr(active, "name", None) or "ROI"
+    ui.label(name).classes("text-lg font-mono break-all")
+    if oxy_filter is True:
+        oxy_text = "HbO"
+    elif oxy_filter is False:
+        oxy_text = "HbR"
+    else:
+        oxy_text = "HbO + HbR"
+    _kv("oxygenation", oxy_text)
+    _kv("members", f"{len(roi_keys)} HRF{'s' if len(roi_keys) != 1 else ''}")
+    _kv("pooled", f"{n_subjects} subjects · {n_channels} channels")
+    if isinstance(anchor, dict) and anchor.get("_key"):
+        _kv("anchored on", anchor["_key"])
+
+    ui.separator()
+    ui.label("ROI HRF (averaged trace)").classes(
+        "text-xs uppercase opacity-60 tracking-wide"
+    )
+    png = _render_roi_average_png(mean, std, sfreq, n_subjects)
+    if png is not None:
+        ui.image(png).classes("max-w-md shrink-0")
+    return True
 
 
 def _render_roi_average(state: AppState) -> None:

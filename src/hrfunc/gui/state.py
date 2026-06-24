@@ -292,6 +292,27 @@ class AppState:
     # OWN HRFs (single + bulk) instead of erroring "HRFs belong to another
     # scan". Only real per-channel Montages are stored (never _CanonicalResult).
     montage_cache: Dict[Path, Any] = field(default_factory=dict)
+    # Project-wide GROUP montage: the per-scan montages in ``montage_cache``
+    # pooled into one so each channel holds EVERY contributing subject's
+    # estimate, then re-distributed so ``trace_std`` is the genuine BETWEEN-
+    # subject std (a single scan's montage has one estimate → std 0). Rebuilt
+    # whenever a scan is (re)estimated; None until ≥1 scan has HRFs. The HRFs
+    # tab can preview this group HRF + variability band. ``hrf_preview_group``
+    # toggles the preview between the selected scan and this group view, and
+    # defaults to the GROUP view — but the group branch only renders once ≥2
+    # subjects exist, so a single-subject project still shows that scan's HRFs.
+    project_montage: Optional[Any] = None
+    hrf_preview_group: bool = True
+    # Resolved scan paths the user has excluded from the group montage (the
+    # in-session "remove subject" control). Filtered out of the pool when the
+    # group montage is rebuilt; kept separate from ``montage_cache`` so the
+    # per-scan HRFs stay available for single-scan / Activity use.
+    project_group_excluded: Set[Path] = field(default_factory=set)
+    # When True, the Activity tab's toeplitz source deconvolves EVERY scan with
+    # the pooled ``project_montage`` (group HRFs, matched by channel name)
+    # instead of each scan's own estimated HRFs. Lets a user apply a group HRF
+    # to scans that weren't individually estimated.
+    activity_use_group_hrfs: bool = False
     # Deconvolved Raw from the most recent estimate_activity call (Sprint 3.4).
     # Typed Any for the same import-graph reason. The Activity panel reads
     # the data + annotations for the lens-style preproc/deconv overlay plot.
@@ -824,6 +845,10 @@ class AppState:
         self.processed_cache.clear()
         self.activity_cache.clear()
         self.montage_cache.clear()
+        self.project_montage = None
+        self.hrf_preview_group = True
+        self.project_group_excluded.clear()
+        self.activity_use_group_hrfs = False
         self.preload_path = None
         self.busy = False
         self.estimation_progress = None

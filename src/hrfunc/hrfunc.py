@@ -108,6 +108,7 @@ def load_montage(json_filename, rich = False, **kwargs):
             if rich == False:
                 channel['estimates'] = []
                 channel['locations'] = []
+                channel['estimate_sources'] = []
             else:
                 for field in ('estimates', 'locations'):
                     if field not in channel:
@@ -115,6 +116,10 @@ def load_montage(json_filename, rich = False, **kwargs):
                             f"entry {key!r} is missing required field "
                             f"{field!r} (rich=True)"
                         )
+                # Provenance is optional for back-compat: bundled HRFs and
+                # saves made before it existed have no estimate_sources. HRF
+                # pads to align with estimates.
+                channel.setdefault('estimate_sources', [])
 
             # Create an HRF node from the saved channel. We must pass
             # channel['context'] through — pre-fix this was omitted, so
@@ -136,6 +141,7 @@ def load_montage(json_filename, rich = False, **kwargs):
                 channel['estimates'],
                 channel['locations'],
                 channel['context'],
+                estimate_sources=channel['estimate_sources'],
             )
 
             # Insert hrf into tree and attach pointer to channel. Populate
@@ -325,7 +331,7 @@ class montage(tree):
         
         return estimate
 
-    def estimate_hrf(self, nirx_obj, events, duration = 30.0, lmbda = 1e-3, edge_expansion = 0.15, preprocess = True, progress_callback = None, timeout = 30):
+    def estimate_hrf(self, nirx_obj, events, duration = 30.0, lmbda = 1e-3, edge_expansion = 0.15, preprocess = True, progress_callback = None, timeout = 30, source_id = None):
         """
         Estimate an HRF subject wise given a nirx object and event impulse series using toeplitz
         deconvolution with regularization.
@@ -456,13 +462,30 @@ class montage(tree):
 
             # Append estimate to channel estimates
             optode = self.channels[standardize_name(channel['ch_name'])]
+            # Provenance: keep estimate_sources parallel to estimates and, when
+            # a source_id is given, REPLACE that source's prior estimate so
+            # re-estimating the same subject doesn't double-count it.
+            if not hasattr(optode, 'estimate_sources'):
+                optode.estimate_sources = []
+            while len(optode.estimate_sources) < len(optode.estimates):
+                optode.estimate_sources.append(None)
+            if source_id is not None:
+                for idx in reversed([
+                    i for i, s in enumerate(optode.estimate_sources)
+                    if s == source_id
+                ]):
+                    del optode.estimates[idx]
+                    if idx < len(optode.locations):
+                        del optode.locations[idx]
+                    del optode.estimate_sources[idx]
             optode.estimates.append(list(hrf_estimate))
 
             # Calculate new centroid for optode given locations used for estimate
             optode.locations.append(list(channel['loc'][:3]))
+            optode.estimate_sources.append(source_id)
 
 
-    def estimate_activity(self, nirx_obj, lmbda = 1e-4, hrf_model = 'toeplitz', preprocess = True, cond_thresh = None, timeout = 30, progress_callback = None, library_trace = None, library_oxygenation = True, drop_failed_channels = True):
+    def estimate_activity(self, nirx_obj, lmbda = 1e-4, hrf_model = 'toeplitz', preprocess = True, cond_thresh = None, timeout = 30, progress_callback = None, library_trace = None, library_oxygenation = True, library_traces = None, library_uncovered = 'skip', drop_failed_channels = True):
         """
         Deconvlve a fNIRS scan using estimated HRF's localized to optodes location
         to gain a neural activity estimate
@@ -480,8 +503,18 @@ class montage(tree):
                 ``library_oxygenation`` and sign-flipped for the opposite oxygenation (HbO and HbR
                 responses are inverses).
             library_oxygenation (bool) - Oxygenation the supplied ``library_trace`` was measured at
-                (True = HbO, False = HbR). Used only when hrf_model='library' to orient the kernel
-                per channel. Default True.
+                (True = HbO, False = HbR). Used only when hrf_model='library' to orient the single
+                kernel per channel. Ignored when ``library_traces`` is given. Default True.
+            library_traces (dict or None) - Per-channel HRtree map: ``{standardized_ch_name: trace}``.
+                When provided (hrf_model='library'), each channel is deconvolved with ITS OWN trace
+                from the map (already oriented by the caller's spatial match) instead of one shared
+                kernel — used by the GUI's per-channel HRtree matching. Channels absent from the map
+                are "uncovered" and handled per ``library_uncovered``. Takes precedence over
+                ``library_trace`` when both are set. Default None (single-kernel mode).
+            library_uncovered (str) - How to treat channels with no entry in ``library_traces``:
+                'skip' (default) drops them from the output so coverage is honest; 'canonical'
+                deconvolves them with the SPM canonical HRF instead. Only used when
+                ``library_traces`` is given.
             preprocess (bool) - If True, preprocess the fNIRS data before estimating the neural activity
             cond_thresh (float or None) - Condition number threshold for falling back to pinv in solve_lstsq
             drop_failed_channels (bool) - If True (default), a channel that errors at any point of
@@ -505,16 +538,33 @@ class montage(tree):
         if lmbda <= 0:
             raise ValueError(f"ERROR: lmbda must be > 0 for Tikhonov regularization, got {lmbda}")
 
-        # Library mode deconvolves every channel with one supplied HRF trace
-        # (e.g. an HRtree selection). Validate + normalize it once up front so
-        # the per-channel loop just orients it by oxygenation.
+        # Library mode deconvolves channels with HRtree-sourced HRF traces.
+        # Two sub-modes:
+        #   - single kernel: every channel uses ``library_trace`` (oriented by
+        #     oxygenation). Back-compat path.
+        #   - per-channel map: ``library_traces`` maps a standardized channel
+        #     name to that channel's own HRtree trace (already oriented by the
+        #     caller's spatial match). Channels absent from the map are
+        #     "uncovered" and handled per ``library_uncovered`` ('skip' drops
+        #     them from the output so coverage is honest; 'canonical' falls back
+        #     to the SPM canonical HRF for them).
+        # Validate + normalize the single kernel up front so the per-channel
+        # loop just orients it by oxygenation.
         library_kernel = None
         if hrf_model == 'library':
-            if library_trace is None or len(library_trace) == 0:
-                raise ValueError("ERROR: hrf_model='library' requires a non-empty library_trace")
-            library_kernel = np.asarray(library_trace, dtype=np.float64)
-            if np.max(np.abs(library_kernel)) == 0:
-                raise ValueError("ERROR: library_trace is all zeros; cannot deconvolve")
+            if library_uncovered not in ('skip', 'canonical'):
+                raise ValueError(
+                    "ERROR: library_uncovered must be 'skip' or 'canonical', "
+                    f"got {library_uncovered!r}"
+                )
+            if library_traces is None:
+                if library_trace is None or len(library_trace) == 0:
+                    raise ValueError("ERROR: hrf_model='library' requires a non-empty library_trace (or a library_traces map)")
+                library_kernel = np.asarray(library_trace, dtype=np.float64)
+                if np.max(np.abs(library_kernel)) == 0:
+                    raise ValueError("ERROR: library_trace is all zeros; cannot deconvolve")
+            elif len(library_traces) == 0:
+                raise ValueError("ERROR: hrf_model='library' with a library_traces map requires at least one channel trace")
 
         # Check montage still needs to be configured
         if self.configured is False:
@@ -610,6 +660,9 @@ class montage(tree):
         # Iterate a snapshot of channel names so we can safely pop orphaned
         # entries inside the loop when deconvolution fails (M4).
         dropped_channels = []
+        # Channels with no per-channel HRtree trace under a library_traces map
+        # and library_uncovered='skip' — dropped from the output and reported.
+        uncovered_channels = []
         all_channels = list(self.channels.keys())
         total_channels = len(all_channels)
         for i, ch_name in enumerate(all_channels):
@@ -649,12 +702,57 @@ class montage(tree):
                 # signs HbO vs HbR. Takes precedence over the canonical fallback.
                 if hrf_model == 'library':
                     estimate_hrf = hrf  # save original; restored after the channel
-                    oriented = (
-                        library_kernel
-                        if _is_oxygenated(ch_name) == bool(library_oxygenation)
-                        else -library_kernel
-                    )
-                    hrf = SimpleNamespace(trace=oriented)
+                    if library_traces is not None:
+                        # Per-channel HRtree map: each channel uses its own
+                        # spatially-matched trace (already oriented by the
+                        # caller). Channels missing from the map are "uncovered".
+                        per_ch = library_traces.get(ch_name)
+                        per_ch_valid = (
+                            per_ch is not None
+                            and len(per_ch) > 0
+                            and np.max(np.abs(np.asarray(per_ch, dtype=np.float64))) > 0
+                        )
+                        if per_ch_valid:
+                            hrf = SimpleNamespace(
+                                trace=np.asarray(per_ch, dtype=np.float64)
+                            )
+                        elif library_uncovered == 'canonical':
+                            # Uncovered → fall back to the SPM canonical HRF for
+                            # this channel (signed per oxygenation by the tree).
+                            print(
+                                f"WARNING: channel {ch_name} has no HRtree HRF in range; "
+                                "falling back to canonical HRF"
+                            )
+                            canonical_duration = float(self.context.get('duration', 30.0))
+                            if _is_oxygenated(ch_name):
+                                hrf = self.hbo_tree.get_canonical_hrf(
+                                    True, self.sfreq, canonical_duration
+                                )
+                            else:
+                                hrf = self.hbr_tree.get_canonical_hrf(
+                                    False, self.sfreq, canonical_duration
+                                )
+                        else:
+                            # Uncovered + skip: drop this channel from the output
+                            # so the activity result only holds channels with a
+                            # real HRtree HRF (honest coverage). Fail loudly.
+                            print(
+                                f"WARNING: channel {ch_name} has no HRtree HRF in range; "
+                                "skipping it (library_uncovered='skip')"
+                            )
+                            for nirx_channel in nirx_obj.info['chs']:
+                                if ch_name == standardize_name(nirx_channel['ch_name']):
+                                    nirx_obj.drop_channels([nirx_channel['ch_name']])
+                                    break
+                            uncovered_channels.append(ch_name)
+                            continue
+                    else:
+                        oriented = (
+                            library_kernel
+                            if _is_oxygenated(ch_name) == bool(library_oxygenation)
+                            else -library_kernel
+                        )
+                        hrf = SimpleNamespace(trace=oriented)
 
                 # If canonical HRF requested (or forced by a degenerate trace)
                 elif hrf_model == 'canonical' or trace_invalid:
@@ -814,6 +912,33 @@ class montage(tree):
                 self.channels['global_hbo'] = self.insert(global_hrf)
             else:
                 self.channels['global_hbr'] = self.insert(global_hrf)
+
+    def remove_source(self, source_id, regenerate = True):
+        """Drop every estimate contributed by ``source_id`` from all channels.
+
+        Provenance-based removal for a multi-subject montage — e.g. drop one
+        subject from a group montage (including one saved then reloaded, since
+        ``estimate_sources`` round-trips through save/load). Keeps estimates /
+        locations / estimate_sources parallel. When ``regenerate`` (default),
+        re-runs ``generate_distribution`` so trace + trace_std reflect the
+        remaining subjects. Returns the number of estimates removed.
+        """
+        removed = 0
+        for optode in self.channels.values():
+            sources = getattr(optode, 'estimate_sources', None)
+            if not sources:
+                continue
+            for idx in reversed([
+                i for i, s in enumerate(sources) if s == source_id
+            ]):
+                del optode.estimates[idx]
+                if idx < len(optode.locations):
+                    del optode.locations[idx]
+                del optode.estimate_sources[idx]
+                removed += 1
+        if regenerate and removed:
+            self.generate_distribution()
+        return removed
 
     def correlate_hrf(self, plot_filename = "montage_correlation.png"):
         """

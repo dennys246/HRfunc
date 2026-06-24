@@ -81,10 +81,19 @@ from ..workers import (
 )
 from ...io.manifest import ScanEntry
 
-# Library default edge-expansion fraction in montage.estimate_hrf. Used to
-# estimate the dropped start-of-scan window for the coverage warning so it
-# matches what the core actually discards.
-_EDGE_EXPANSION = 0.15
+# GUI default edge-expansion fraction passed to montage.estimate_hrf. The
+# core library default is 0.15; the GUI defaults a touch higher (0.2) because
+# a slightly wider pad reduces edge-instability in practice, and exposes it as
+# a user control. Used both as the estimate_hrf kwarg and to estimate the
+# dropped start-of-scan window for the coverage warning so it matches what the
+# core actually discards for the user's chosen value.
+DEFAULT_EDGE_EXPANSION = 0.2
+
+# Edge-instability QC defaults: flag a channel when its HRF trace's local std
+# over the outer DEFAULT_EDGE_STD_FRAC (each end) exceeds DEFAULT_EDGE_STD_RATIO
+# × the center std. Both are exposed as user controls.
+DEFAULT_EDGE_STD_FRAC = 0.15
+DEFAULT_EDGE_STD_RATIO = 2.0
 
 
 def _file_applies_to_scan(state: AppState, scan: Optional[ScanEntry]) -> bool:
@@ -282,6 +291,17 @@ class EstimationOptions:
     # Per-channel lstsq solve timeout (seconds), forwarded to
     # montage.estimate_hrf. A channel that exceeds it is skipped.
     timeout: float = DEFAULT_TIMEOUT
+    # Edge-expansion fraction forwarded to montage.estimate_hrf: each event
+    # onset is shifted back by ``edge_expansion * duration`` seconds so the
+    # estimation window captures the pre-onset baseline / ramp. A wider pad
+    # reduces edge instability but drops more early-scan events.
+    edge_expansion: float = DEFAULT_EDGE_EXPANSION
+    # Edge-instability QC sensitivity (post-estimation check): a channel is
+    # flagged when its HRF trace's local std over the outer ``edge_std_frac``
+    # (each end) exceeds ``edge_std_ratio`` × the center std. Both are
+    # user-tunable so the check can be made stricter / looser.
+    edge_std_frac: float = DEFAULT_EDGE_STD_FRAC
+    edge_std_ratio: float = DEFAULT_EDGE_STD_RATIO
 
 
 def render(state: AppState) -> None:
@@ -305,6 +325,10 @@ def render(state: AppState) -> None:
     state.subscribe("scan_selected", _refresh)
     state.subscribe("scan_loaded", _refresh)
     state.subscribe("preprocess_done", _refresh)
+    # Rebuild the pooled project (group) montage BEFORE the body re-renders,
+    # so the group preview reflects the scan that just finished. Registered
+    # ahead of the _refresh subscription below so it runs first.
+    state.subscribe("hrf_estimated", lambda *_: _rebuild_project_montage(state))
     state.subscribe("hrf_estimated", _refresh)
     # Dedicated event for gallery channel-pick refreshes — fires only the
     # HRFs-tab body re-render, avoiding the 6-subscriber re-render
@@ -359,10 +383,24 @@ def _render_body(state: AppState, opts: EstimationOptions) -> None:
         ui.label("HRFs").classes("text-2xl font-semibold")
 
         if scan is None and not bulk_mode:
-            ui.label(
-                "Select a scan from the dataset tree, or tick scans "
-                "for a bulk run."
-            ).classes("text-sm opacity-60")
+            # Disclaimer callout: nothing can be estimated until a scan is
+            # picked, so make the next step obvious rather than a faint line.
+            with ui.row().classes(
+                "w-full items-center gap-3 p-4 rounded border "
+                "border-amber-500/40 bg-amber-500/10"
+            ):
+                ui.icon("arrow_back", size="1.5rem").classes("text-amber-400")
+                with ui.column().classes("gap-0"):
+                    ui.label(
+                        "Select a scan to start estimating HRFs"
+                    ).classes("text-sm font-medium text-amber-300")
+                    ui.label(
+                        "Pick a scan from the dataset tree on the left, or "
+                        "tick several scans there for a bulk run."
+                    ).classes("text-xs opacity-70")
+            # Submission stays available with no scan selected so users who
+            # only want to share an existing HRF JSON they have on disk can.
+            _render_submission_section(state)
             return
 
         # Two-column workspace: estimation controls on the left, the
@@ -407,19 +445,255 @@ def _render_body(state: AppState, opts: EstimationOptions) -> None:
                         if scan is not None:
                             _render_toeplitz_controls(state, opts, scan)
                         else:
-                            ui.label(
-                                "Pick one of the checked scans to populate the "
-                                "event picker / lambda / duration controls."
-                            ).classes("text-sm opacity-60")
+                            # Bulk: scans ticked, no row selected. Show the
+                            # global lambda / duration / timeout controls so
+                            # the batch can be tuned, plus a preprocess-
+                            # readiness summary + "Preprocess all checked"
+                            # button. Per-scan events are auto-discovered at
+                            # run time (see the bulk note above), so there's
+                            # no event picker in this branch.
+                            from .preprocess_panel import (
+                                render_preprocess_all_checked,
+                            )
+                            _render_toeplitz_global_params(opts)
+                            render_preprocess_all_checked(
+                                state, checked_scans
+                            )
                     else:
                         _render_canonical_note()
 
-                # ── Run button + progress / error display
+                # ── Run button (+ Save when ready) + progress / error display
                 _render_run_row(state, scan, checked_scans, opts)
 
-            # ── Right column: per-channel HRF visualization + save / submit
+                # ── Submission — directly below Estimate, always present so an
+                # existing HRF JSON can be shared without estimating first.
+                _render_submission_section(state)
+
+            # ── Right column: per-channel HRF visualization
             with ui.column().classes("flex-1 min-w-0 gap-3"):
                 _render_preview_column(state, scan, opts, bulk_mode)
+
+
+def _project_montages(state: AppState) -> list:
+    """Real per-scan montages in the group pool (skips canonical + excluded)."""
+    return [
+        m for path, m in state.montage_cache.items()
+        if m is not None and not isinstance(m, _CanonicalResult)
+        and path not in state.project_group_excluded
+    ]
+
+
+def _project_subject_count(state: AppState) -> int:
+    return len(_project_montages(state))
+
+
+def _build_project_montage(sourced_montages: list):
+    """Pool per-scan montages into one GROUP montage, tagging provenance.
+
+    ``sourced_montages`` is a list of ``(source_id, montage)`` pairs. Each group
+    channel collects EVERY contributing subject's estimate (tagging each with
+    its ``source_id`` in ``estimate_sources``), then ``generate_distribution``
+    re-means/re-stds across them — so ``trace_std`` becomes the genuine
+    between-subject variability (a single scan's montage has one estimate → std
+    0). Tagging lets a saved+reloaded group montage still report / remove a
+    specific subject (see ``montage.remove_source``). Returns None when nothing
+    poolable. Duck-typed (``.channels`` of nodes with ``.estimates`` /
+    ``.estimate_sources`` + a ``.generate_distribution()``) so tests can pass
+    lightweight fakes.
+    """
+    import copy
+
+    real = [
+        (sid, m) for sid, m in sourced_montages
+        if m is not None and not isinstance(m, _CanonicalResult)
+    ]
+    if not real:
+        return None
+
+    group = copy.deepcopy(real[0][1])
+    # Union of channels: graft in any channel present in a later subject but
+    # absent from the base (heterogeneous montage layouts across subjects).
+    for _sid, m in real[1:]:
+        for ch, node in getattr(m, "channels", {}).items():
+            if ch not in group.channels:
+                group.channels[ch] = copy.deepcopy(node)
+    # Pool every subject's estimate into each channel, tagged by source.
+    for ch, gnode in group.channels.items():
+        pooled, sources = [], []
+        for sid, m in real:
+            other = getattr(m, "channels", {}).get(ch)
+            if other is not None and getattr(other, "estimates", None):
+                for est in other.estimates:
+                    pooled.append(est)
+                    sources.append(sid)
+        gnode.estimates = pooled
+        gnode.estimate_sources = sources
+    try:
+        group.generate_distribution()
+    except Exception as exc:  # noqa: BLE001 — never break the panel on a pool error
+        logger.warning("project montage generate_distribution failed: %s", exc)
+        return None
+    return group
+
+
+def _sourced_project_montages(state: AppState) -> list:
+    """``(source_id, montage)`` pairs for the group pool — source id is the
+    scan's resolved path string (stable, unique, survives manifest rebuilds)."""
+    return [
+        (str(path), m) for path, m in state.montage_cache.items()
+        if m is not None and not isinstance(m, _CanonicalResult)
+        and path not in state.project_group_excluded
+    ]
+
+
+def _rebuild_project_montage(state: AppState) -> None:
+    """Refresh ``state.project_montage`` from the current per-scan cache."""
+    state.project_montage = _build_project_montage(
+        _sourced_project_montages(state)
+    )
+
+
+def _render_preview_view_toggle(state: AppState, n_subjects: int) -> None:
+    """Radio toggle between the selected scan's HRFs and the group montage."""
+    def _set(event) -> None:
+        state.hrf_preview_group = bool(event.value)
+        state.publish("hrf_selection_changed")
+
+    ui.radio(
+        {False: "This scan", True: f"Group ({n_subjects} subjects)"},
+        value=state.hrf_preview_group,
+        on_change=_set,
+    ).props("inline dense").classes("text-xs")
+
+
+def _group_subject_names(state: AppState) -> list:
+    """Display names of the scans contributing to the group montage.
+
+    Maps the (non-canonical) ``montage_cache`` keys back to manifest scans;
+    falls back to the path stem when a key isn't in the current manifest.
+    """
+    contributing = {
+        path for path, m in state.montage_cache.items()
+        if m is not None and not isinstance(m, _CanonicalResult)
+        and path not in state.project_group_excluded
+    }
+    by_path = {}
+    if state.manifest is not None:
+        by_path = {s.path.resolve(): s for s in state.manifest.scans}
+    names = []
+    for path in contributing:
+        scan = by_path.get(path)
+        names.append(
+            (scan.display_name or scan.path.name) if scan is not None
+            else path.stem
+        )
+    return sorted(names)
+
+
+async def _save_group_montage(state: AppState) -> None:
+    """Save the pooled group montage to JSON (reuses the Export save path)."""
+    import asyncio
+
+    montage = state.project_montage
+    if montage is None:
+        state.last_error = "No group montage to save."
+        return
+    from .export_panel import _pick_save_path, save_montage_sync
+
+    path = await _pick_save_path(
+        suggested="group_hrfs.json", title="Save group HRFs"
+    )
+    if path is None:
+        return
+    try:
+        await asyncio.get_event_loop().run_in_executor(
+            None, save_montage_sync, montage, path
+        )
+        ui.notify(f"Saved group HRFs: {path.name}", type="positive")
+    except Exception as exc:  # noqa: BLE001
+        state.last_error = f"Save failed: {type(exc).__name__}: {exc}"
+        logger.exception("group montage save failed: %s", exc)
+        ui.notify(state.last_error, type="negative")
+
+
+def _group_subject_entries(state: AppState) -> list:
+    """``(path, name, excluded)`` for every non-canonical cached scan."""
+    by_path = {}
+    if state.manifest is not None:
+        by_path = {s.path.resolve(): s for s in state.manifest.scans}
+    out = []
+    for path, m in state.montage_cache.items():
+        if m is None or isinstance(m, _CanonicalResult):
+            continue
+        scan = by_path.get(path)
+        name = (scan.display_name or scan.path.name) if scan else path.stem
+        out.append((path, name, path in state.project_group_excluded))
+    return sorted(out, key=lambda e: e[1])
+
+
+def _set_group_excluded(state: AppState, path, excluded: bool) -> None:
+    if excluded:
+        state.project_group_excluded.add(path)
+    else:
+        state.project_group_excluded.discard(path)
+    _rebuild_project_montage(state)
+    state.publish("hrf_selection_changed")
+
+
+def _render_group_subjects(state: AppState) -> None:
+    """Contributing-subjects readout, per-subject remove/restore, + Save."""
+    entries = _group_subject_entries(state)
+    included = [e for e in entries if not e[2]]
+    excluded = [e for e in entries if e[2]]
+
+    ui.label(f"Contributing scans ({len(included)})").classes(
+        "text-xs uppercase opacity-60 tracking-wide"
+    )
+    with ui.row().classes("items-center gap-1 flex-wrap"):
+        for path, name, _ in included:
+            with ui.row().classes(
+                "items-center gap-1 px-2 py-0.5 rounded bg-slate-700/40"
+            ):
+                ui.label(name).classes("text-xs")
+                # Keep at least 2 subjects so it stays a group (and the view +
+                # restore controls remain reachable).
+                if len(included) > 2:
+                    ui.button(
+                        icon="close",
+                        on_click=lambda p=path: _set_group_excluded(
+                            state, p, True
+                        ),
+                    ).props("flat dense round size=xs").tooltip(
+                        "Remove this subject from the group"
+                    )
+
+    if excluded:
+        with ui.row().classes("items-center gap-2 flex-wrap"):
+            ui.label(
+                "Excluded: " + ", ".join(e[1] for e in excluded)
+            ).classes("text-xs opacity-50")
+            ui.button(
+                "Restore all",
+                on_click=lambda: _set_group_excluded_restore_all(state),
+            ).props("flat dense size=xs color=primary")
+
+    async def _on_save() -> None:
+        await _save_group_montage(state)
+
+    with ui.row().classes("items-center gap-2"):
+        ui.button(
+            "Save group HRFs", icon="save", on_click=_on_save,
+        ).props("flat dense color=primary")
+        ui.label(
+            "Saves the pooled multi-subject HRFs (mean + std) as a "
+            "tree.load_hrfs JSON — the submission form below can share it."
+        ).classes("text-xs opacity-50")
+
+
+def _set_group_excluded_restore_all(state: AppState) -> None:
+    state.project_group_excluded.clear()
+    _rebuild_project_montage(state)
+    state.publish("hrf_selection_changed")
 
 
 def _render_preview_column(
@@ -428,16 +702,17 @@ def _render_preview_column(
     opts: EstimationOptions,
     bulk_mode: bool,
 ) -> None:
-    """Right-hand column: the per-channel HRF visualization + save/submit.
+    """Right-hand column: the per-channel HRF visualization.
 
     Kept in its own column (mirroring the HRtree detail pane) so the channel
     accordion has horizontal room and the estimation controls on the left stay
-    compact. Shows a placeholder until a montage exists.
+    compact. Shows a placeholder until a montage exists. The Save button and
+    submission form live in the left column (next to / below Estimate).
 
     Bulk mode overwrites ``state.montage`` scan-by-scan, so during a run the
     preview would just flash whichever scan landed last -- we gate on
     ``not state.busy`` so it only appears once the batch FINISHES, and point
-    the preview/save at the scan that actually produced the montage
+    the preview at the scan that actually produced the montage
     (``montage_source_scan``) rather than the UI selection.
     """
     ui.label("HRF preview").classes(
@@ -447,6 +722,21 @@ def _render_preview_column(
     if state.busy:
         ui.label("Estimating…").classes("text-sm opacity-60")
         return
+
+    # Group view: once ≥2 scans have HRFs, offer a toggle between the selected
+    # scan's HRFs and the pooled project (group) montage, whose ±std band is
+    # the genuine between-subject variability.
+    n_subjects = _project_subject_count(state)
+    if n_subjects >= 2 and state.project_montage is not None:
+        _render_preview_view_toggle(state, n_subjects)
+        if state.hrf_preview_group:
+            ui.label(
+                f"Group HRF — {n_subjects} subjects (between-subject ± std)."
+            ).classes("text-sm font-medium")
+            _render_group_subjects(state)
+            _render_edge_qc(state.project_montage, opts)
+            _render_toeplitz_gallery(state, state.project_montage)
+            return
 
     preview_scan = scan if not bulk_mode else state.montage_source_scan
     if state.montage is None or preview_scan is None:
@@ -460,36 +750,57 @@ def _render_preview_column(
         ui.label(
             f"Showing HRFs for the last-estimated scan: {shown}. "
             "A bulk run keeps only the most recent scan's HRFs in memory — "
-            "save each scan's HRFs (below or via mass-save), or select a "
-            "single scan to view or re-estimate it."
+            "save each scan's HRFs (the Save button by Estimate, or mass-"
+            "save), or select a single scan to view or re-estimate it."
         ).classes("text-xs opacity-70 italic")
 
     _render_hrf_preview(state, preview_scan, opts)
 
-    # Save the estimated HRFs to JSON right here (same action as the Export
-    # tab's "Save montage HRFs"). Only meaningful for a real toeplitz montage.
-    if not isinstance(state.montage, _CanonicalResult):
-        async def _on_save_hrfs(_scan=preview_scan) -> None:
-            from .export_panel import _save_montage
-            await _save_montage(state, _scan)
 
-        with ui.row().classes("items-center gap-2"):
-            ui.button(
-                "Save",
-                icon="save",
-                on_click=_on_save_hrfs,
-            ).props("color=primary")
-            ui.label(
-                "Saves the per-channel estimated HRFs as a tree.load_hrfs "
-                "JSON file."
-            ).classes("text-xs opacity-60")
+def _render_save_button(
+    state: AppState, scan: Optional[ScanEntry], bulk_mode: bool
+) -> None:
+    """Save-HRFs button, shown beside Estimate only when there's a real
+    (toeplitz) montage to save — same pop-in-when-ready behaviour it had in
+    the preview column, just relocated next to the Estimate button.
 
-    # Submission card -- same form the Export tab renders. Surfaced here so
-    # users who finish an estimation can go straight to sharing without
-    # hopping to Export. The file picker defaults to state.last_saved_roi_path
-    # (set by the Cluster sub-tab's Save montage flow); if the user hasn't
-    # saved yet, they pick the JSON manually.
-    ui.separator()
+    Bulk mode points the save at the scan that produced the in-memory montage
+    (``montage_source_scan``), matching the preview. Canonical results aren't
+    saveable here (no per-channel estimates), so the button stays hidden.
+    """
+    if state.busy:
+        return
+    save_scan = scan if not bulk_mode else state.montage_source_scan
+    if (
+        state.montage is None
+        or save_scan is None
+        or isinstance(state.montage, _CanonicalResult)
+    ):
+        return
+
+    async def _on_save_hrfs(_scan=save_scan) -> None:
+        from .export_panel import _save_montage
+        await _save_montage(state, _scan)
+
+    ui.button(
+        "Save",
+        icon="save",
+        on_click=_on_save_hrfs,
+    ).props("color=primary").tooltip(
+        "Saves the per-channel estimated HRFs as a tree.load_hrfs JSON file."
+    )
+
+
+def _render_submission_section(state: AppState) -> None:
+    """HRF submission form — same form the Export tab renders, surfaced right
+    below the Estimate button.
+
+    Always rendered (not gated on an in-memory montage) so a user who just
+    wants to share an existing HRF JSON they have on disk can do it here
+    without first estimating. The file picker defaults to
+    ``state.last_saved_roi_path`` (set by a prior save / the Cluster sub-tab);
+    otherwise they pick the JSON manually.
+    """
     with ui.card().classes("w-full"):
         from ..submission import render_submission_panel
         render_submission_panel(
@@ -991,7 +1302,7 @@ async def _estimate_clicked(
             raw = state.processed_cache.get(scan)
             sfreq = float(raw.info["sfreq"])
             n_samples = int(raw.n_times)
-            edge_samples = int(round(_EDGE_EXPANSION * opts.duration * sfreq))
+            edge_samples = int(round(opts.edge_expansion * opts.duration * sfreq))
             if state.events_impulse is not None:
                 cov = coverage_report_vector(
                     state.events_impulse, sfreq, n_samples, edge_samples,
@@ -1090,6 +1401,17 @@ def _render_toeplitz_controls(
                     on_change=(lambda e, n=name: _toggle(n, bool(e.value))),
                 )
 
+    _render_toeplitz_global_params(opts)
+
+
+def _render_toeplitz_global_params(opts: EstimationOptions) -> None:
+    """Lambda / duration / timeout controls + edge advisory for toeplitz mode.
+
+    These are all ``opts``-global (no per-scan dependency), so they render in
+    both the single-scan path (inside ``_render_toeplitz_controls``) and the
+    bulk path (no row selected, scans ticked) — letting a bulk run be tuned
+    without first clicking a scan.
+    """
     # ── Lambda slider (log scale)
     ui.label("Regularization (lambda)").classes(
         "text-xs uppercase opacity-60 tracking-wide"
@@ -1149,17 +1471,80 @@ def _render_toeplitz_controls(
         "Seconds to wait for one channel's solve before skipping it."
     )
 
-    # ── Edge-expansion advisory (library default 0.15 of duration)
-    # estimate_hrf shifts every event onset back by edge_expansion*duration
-    # seconds and silently drops events that would fall before t=0. With
-    # the library default (0.15) and the user's current duration, that
-    # means events in the first ``edge_seconds`` of the scan are lost.
-    edge_seconds = 0.15 * opts.duration
+    # ── Edge expansion (forwarded to estimate_hrf). Each onset is shifted
+    # back by ``edge_expansion * duration`` s so the window captures the
+    # pre-onset baseline; widen it if the estimated HRFs are noisy/unstable
+    # at their edges (the QC check below flags that).
+    ui.label("Edge expansion (fraction of duration)").classes(
+        "text-xs uppercase opacity-60 tracking-wide"
+    )
+
+    def _on_edge_expansion(event) -> None:
+        try:
+            opts.edge_expansion = max(0.0, min(1.0, float(event.value)))
+        except (TypeError, ValueError):
+            opts.edge_expansion = DEFAULT_EDGE_EXPANSION
+
+    ui.number(
+        value=opts.edge_expansion,
+        min=0.0, max=1.0, step=0.05,
+        format="%.2f",
+        on_change=_on_edge_expansion,
+    ).tooltip(
+        "Pads each event's estimation window back by this fraction of the "
+        "duration. Higher = more stable HRF edges, but events in the first "
+        "edge_expansion × duration seconds are dropped."
+    )
+
+    # ── Edge-expansion advisory: estimate_hrf shifts every event onset back
+    # by edge_expansion*duration seconds and silently drops events that would
+    # fall before t=0, so events in the first ``edge_seconds`` are lost.
+    edge_seconds = opts.edge_expansion * opts.duration
     ui.label(
         f"Note: events in the first ~{edge_seconds:.1f} s of the scan are "
-        f"dropped by the toeplitz edge-expansion window (library default "
-        f"0.15 × duration). Consider this when designing trial-onset timing."
+        f"dropped by the toeplitz edge-expansion window "
+        f"({opts.edge_expansion:.2f} × duration). Consider this when "
+        "designing trial-onset timing."
     ).classes("text-xs opacity-60 italic")
+
+    # ── Edge-noise QC sensitivity (drives the post-estimation warning).
+    ui.label("Edge-noise QC sensitivity").classes(
+        "text-xs uppercase opacity-60 tracking-wide"
+    )
+
+    def _on_qc_frac(event) -> None:
+        try:
+            opts.edge_std_frac = max(0.01, min(0.49, float(event.value)))
+        except (TypeError, ValueError):
+            opts.edge_std_frac = DEFAULT_EDGE_STD_FRAC
+
+    def _on_qc_ratio(event) -> None:
+        try:
+            opts.edge_std_ratio = max(1.0, float(event.value))
+        except (TypeError, ValueError):
+            opts.edge_std_ratio = DEFAULT_EDGE_STD_RATIO
+
+    with ui.row().classes("w-full items-center gap-3 no-wrap"):
+        ui.number(
+            "Edge window (frac)",
+            value=opts.edge_std_frac,
+            min=0.01, max=0.49, step=0.05,
+            format="%.2f",
+            on_change=_on_qc_frac,
+        ).props("dense").classes("flex-1").tooltip(
+            "Fraction of the HRF (each end) treated as 'edge' when comparing "
+            "its local noise to the center."
+        )
+        ui.number(
+            "Flag ratio (×)",
+            value=opts.edge_std_ratio,
+            min=1.0, max=10.0, step=0.5,
+            format="%.1f",
+            on_change=_on_qc_ratio,
+        ).props("dense").classes("flex-1").tooltip(
+            "Warn when a channel's edge std exceeds this multiple of its "
+            "center std. Lower = stricter."
+        )
 
 
 def _render_canonical_note() -> None:
@@ -1219,6 +1604,9 @@ def _render_run_row(
             run_label,
             on_click=_on_estimate,
         ).props(f"color=primary {'disable' if not can_run else ''}")
+        # Save sits immediately to the right of Estimate, popping in only once
+        # there's a real montage to save (see _render_save_button).
+        _render_save_button(state, scan, bulk_mode)
         if state.busy:
             _render_busy_progress(state)
         elif (
@@ -1339,6 +1727,7 @@ def _run_bulk(
         duration=opts.duration,
         selected_events=opts.selected_events,
         timeout=opts.timeout,
+        edge_expansion=opts.edge_expansion,
     )
 
     def _build(scan: ScanEntry):
@@ -1375,6 +1764,7 @@ def _run_bulk(
                     duration=snapshot.duration,
                     selected_events=selected,
                     timeout=snapshot.timeout,
+                    edge_expansion=snapshot.edge_expansion,
                 )
                 return run_toeplitz_sync(
                     raw, scan_opts, progress_cb, event_rows, event_impulse
@@ -1461,6 +1851,7 @@ def _run(
         duration=opts.duration,
         selected_events=opts.selected_events,
         timeout=opts.timeout,
+        edge_expansion=opts.edge_expansion,
     )
 
     if snapshot.model == MODEL_TOEPLITZ:
@@ -1559,6 +1950,7 @@ def run_toeplitz_sync(
         events=events.tolist(),
         duration=opts.duration,
         lmbda=opts.lmbda,
+        edge_expansion=opts.edge_expansion,
         preprocess=False,
         progress_callback=progress_callback,
         timeout=opts.timeout,
@@ -1725,7 +2117,89 @@ def _render_hrf_preview(
         ).classes("text-sm opacity-60")
         return
 
+    _render_edge_qc(result, opts)
     _render_toeplitz_gallery(state, result)
+
+
+def _edge_unstable_channels(
+    montage,
+    *,
+    edge_frac: float = DEFAULT_EDGE_STD_FRAC,
+    ratio: float = DEFAULT_EDGE_STD_RATIO,
+) -> list:
+    """Channel names whose HRF TRACE wobbles more at its edges than its center.
+
+    Compares the local standard deviation of the estimated HRF ``trace`` over
+    its outer ``edge_frac`` (each end) to the std of its center. A clean HRF
+    has its response in the center (high local std) and a flat baseline at the
+    edges (low local std), so ``edge_std > ratio × center_std`` flags edges
+    that fluctuate more than the response itself — a sign the estimation
+    window is too tight (raise ``edge_expansion``).
+
+    NB: this reads ``node.trace`` (the estimate itself), NOT ``node.trace_std``
+    — that field is the ACROSS-SUBJECT std and is all-zero for a single-scan
+    estimate, so it can't drive a per-scan QC. Channels without a usable trace,
+    too-short traces, or a flat center (std 0) are skipped. Pure + module-level
+    so tests can call it directly.
+    """
+    import numpy as np
+
+    flagged: list = []
+    channels = getattr(montage, "channels", {})
+    for ch_name, node in channels.items():
+        if "global" in str(ch_name):
+            continue
+        trace = getattr(node, "trace", None)
+        if trace is None:
+            continue
+        arr = np.asarray(trace, dtype=float)
+        n = arr.size
+        if n < 6 or not np.all(np.isfinite(arr)):
+            continue
+        k = max(1, int(round(n * edge_frac)))
+        if n <= 2 * k:
+            continue
+        edge_std = float(np.std(np.concatenate([arr[:k], arr[-k:]])))
+        center_std = float(np.std(arr[k:-k]))
+        if center_std > 0 and edge_std > ratio * center_std:
+            flagged.append(ch_name)
+    return flagged
+
+
+def _render_edge_qc(montage, opts: EstimationOptions) -> None:
+    """Warn when estimated HRFs fluctuate more at their edges than their center.
+
+    Surfaces an amber callout (with the offending channels) suggesting a larger
+    edge_expansion when enough channels trip the configurable edge-noise ratio.
+    """
+    flagged = _edge_unstable_channels(
+        montage,
+        edge_frac=opts.edge_std_frac,
+        ratio=opts.edge_std_ratio,
+    )
+    if not flagged:
+        return
+    n = len(flagged)
+    preview = ", ".join(str(c) for c in flagged[:6])
+    if n > 6:
+        preview += f", +{n - 6} more"
+    with ui.row().classes(
+        "w-full items-start gap-2 p-3 rounded border "
+        "border-amber-500/40 bg-amber-500/10"
+    ):
+        ui.icon("warning", size="1.25rem").classes("text-amber-400 shrink-0")
+        with ui.column().classes("gap-0"):
+            ui.label(
+                f"{n} channel{'s' if n != 1 else ''} fluctuate more at the "
+                f"edges than the center (edge std > {opts.edge_std_ratio:g}× "
+                "center)."
+            ).classes("text-sm font-medium text-amber-300")
+            ui.label(
+                f"This often means the estimation window is too tight — try "
+                f"raising Edge expansion (currently {opts.edge_expansion:.2f}) "
+                "and re-estimating."
+            ).classes("text-xs opacity-70")
+            ui.label(preview).classes("text-xs font-mono opacity-50")
 
 
 def _render_toeplitz_gallery(state: AppState, montage) -> None:
@@ -1747,9 +2221,38 @@ def _render_toeplitz_gallery(state: AppState, montage) -> None:
         "open a channel to view its estimated response."
     ).classes("text-xs opacity-60")
 
+    # Explain the absent ±std band so it's not read as a bug: trace_std is the
+    # ACROSS-SUBJECT std (needs ≥2 pooled estimates), so a single-scan estimate
+    # has none. Only shown when every channel's std is empty/zero.
+    if _std_is_all_zero(montage):
+        ui.label(
+            "No ±std band shown — the band is across-subject variance, which "
+            "needs ≥2 pooled estimates; a single-scan estimate has none. Pool "
+            "scans or use the HRtree library to get a variability band."
+        ).classes("text-xs opacity-50 italic")
+
     with ui.column().classes("w-full gap-1 max-w-2xl"):
         for index, (ch_name, node) in enumerate(channels.items()):
             _render_channel_dropdown(node, ch_name, open_default=(index == 0))
+
+
+def _std_is_all_zero(montage) -> bool:
+    """True when every channel's ``trace_std`` is empty / all-zero.
+
+    That's the single-scan case: ``trace_std`` is the across-subject std
+    (``np.std`` over the per-subject estimates), so one estimate yields zeros.
+    Used to caption the preview rather than leave an invisible band unexplained.
+    """
+    import numpy as np
+
+    for node in getattr(montage, "channels", {}).values():
+        std = getattr(node, "trace_std", None)
+        if std is None:
+            continue
+        arr = np.asarray(std, dtype=float)
+        if arr.size and np.any(np.isfinite(arr) & (np.abs(arr) > 0)):
+            return False
+    return True
 
 
 def _render_channel_dropdown(node, ch_name: str, open_default: bool) -> None:

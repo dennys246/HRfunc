@@ -383,6 +383,27 @@ def _render_data_tab(
     state.subscribe("project_changed", lambda _m=None: _body.refresh())
 
 
+def _demo_data_path() -> Optional[Path]:
+    """Resolve the bundled sample SNIRF folder for the 'Demo data' button.
+
+    Walks up from the ``hrfunc`` package to the repo root and looks for
+    ``tests/data/sNIRF_formatted``. Returns None when it's absent (e.g. an
+    installed wheel that doesn't ship the test data) so the button hides
+    rather than pointing at nothing.
+    """
+    try:
+        import hrfunc
+
+        pkg = Path(hrfunc.__file__).resolve().parent  # …/src/hrfunc
+        # src/hrfunc → src → repo root
+        candidate = pkg.parents[1] / "tests" / "data" / "sNIRF_formatted"
+        if candidate.is_dir() and any(candidate.glob("*.snirf")):
+            return candidate
+    except Exception as exc:  # noqa: BLE001 — best-effort; hide on any failure
+        logger.debug("demo data path unavailable: %s", exc)
+    return None
+
+
 def _render_empty_state(state: AppState, *, verb: str) -> None:
     """Render the centered no-project prompt for a data-dependent tab.
 
@@ -429,6 +450,32 @@ def _render_empty_state(state: AppState, *, verb: str) -> None:
             icon="folder_open",
             on_click=_on_click,
         ).props("color=primary")
+
+        # Demo data: one-click load of the bundled sample SNIRF scans so a
+        # first-time user can explore the app without their own data. Only
+        # shown when the test data is actually present (a source checkout);
+        # an installed wheel that doesn't ship tests/ hides it.
+        demo_path = _demo_data_path()
+        if demo_path is not None:
+            async def _on_demo() -> None:
+                if state.busy:
+                    ui.notify(
+                        "A task is still running — wait for it to finish "
+                        "before loading the demo data.",
+                        type="warning",
+                    )
+                    return
+                await dataset_picker.open_project_path(state, demo_path)
+
+            ui.button(
+                "Try the rock-paper-scissors demo",
+                icon="science",
+                on_click=_on_demo,
+            ).props("flat color=primary")
+            ui.label(
+                "Loads a bundled rock-paper-scissors fNIRS dataset (the events "
+                "are rock / paper / scissors trials) to explore the app."
+            ).classes("text-xs opacity-50")
 
 
 def _on_scan_selected(state: AppState, scan: Optional[ScanEntry]) -> None:

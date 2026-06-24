@@ -145,10 +145,27 @@ async def test_empty_state_appears_on_data_tabs(user: User):
 
 
 async def test_empty_state_has_open_folder_button(user: User):
-    """The empty-state's single CTA is "Open folder" — same picker as
+    """The empty-state's primary CTA is "Open folder" — same picker as
     the toolbar dropdown."""
     await user.open("/")
     await user.should_see("Open folder")
+
+
+def test_demo_data_path_resolves_to_bundled_snirf():
+    """In a source checkout, the demo button targets the bundled SNIRF folder."""
+    from hrfunc.gui.pages import shell
+
+    path = shell._demo_data_path()
+    assert path is not None
+    assert path.name == "sNIRF_formatted"
+    assert any(path.glob("*.snirf"))
+
+
+async def test_empty_state_shows_demo_button(user: User):
+    """When the bundled sample data is present, the empty-state offers a
+    rock-paper-scissors demo alongside Open folder."""
+    await user.open("/")
+    await user.should_see("rock-paper-scissors demo")
 
 
 # ---------------------------------------------------------------------------
