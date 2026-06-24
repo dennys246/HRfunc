@@ -108,6 +108,7 @@ def load_montage(json_filename, rich = False, **kwargs):
             if rich == False:
                 channel['estimates'] = []
                 channel['locations'] = []
+                channel['estimate_sources'] = []
             else:
                 for field in ('estimates', 'locations'):
                     if field not in channel:
@@ -115,6 +116,10 @@ def load_montage(json_filename, rich = False, **kwargs):
                             f"entry {key!r} is missing required field "
                             f"{field!r} (rich=True)"
                         )
+                # Provenance is optional for back-compat: bundled HRFs and
+                # saves made before it existed have no estimate_sources. HRF
+                # pads to align with estimates.
+                channel.setdefault('estimate_sources', [])
 
             # Create an HRF node from the saved channel. We must pass
             # channel['context'] through — pre-fix this was omitted, so
@@ -136,6 +141,7 @@ def load_montage(json_filename, rich = False, **kwargs):
                 channel['estimates'],
                 channel['locations'],
                 channel['context'],
+                estimate_sources=channel['estimate_sources'],
             )
 
             # Insert hrf into tree and attach pointer to channel. Populate
@@ -325,7 +331,7 @@ class montage(tree):
         
         return estimate
 
-    def estimate_hrf(self, nirx_obj, events, duration = 30.0, lmbda = 1e-3, edge_expansion = 0.15, preprocess = True, progress_callback = None, timeout = 30):
+    def estimate_hrf(self, nirx_obj, events, duration = 30.0, lmbda = 1e-3, edge_expansion = 0.15, preprocess = True, progress_callback = None, timeout = 30, source_id = None):
         """
         Estimate an HRF subject wise given a nirx object and event impulse series using toeplitz
         deconvolution with regularization.
@@ -456,10 +462,27 @@ class montage(tree):
 
             # Append estimate to channel estimates
             optode = self.channels[standardize_name(channel['ch_name'])]
+            # Provenance: keep estimate_sources parallel to estimates and, when
+            # a source_id is given, REPLACE that source's prior estimate so
+            # re-estimating the same subject doesn't double-count it.
+            if not hasattr(optode, 'estimate_sources'):
+                optode.estimate_sources = []
+            while len(optode.estimate_sources) < len(optode.estimates):
+                optode.estimate_sources.append(None)
+            if source_id is not None:
+                for idx in reversed([
+                    i for i, s in enumerate(optode.estimate_sources)
+                    if s == source_id
+                ]):
+                    del optode.estimates[idx]
+                    if idx < len(optode.locations):
+                        del optode.locations[idx]
+                    del optode.estimate_sources[idx]
             optode.estimates.append(list(hrf_estimate))
 
             # Calculate new centroid for optode given locations used for estimate
             optode.locations.append(list(channel['loc'][:3]))
+            optode.estimate_sources.append(source_id)
 
 
     def estimate_activity(self, nirx_obj, lmbda = 1e-4, hrf_model = 'toeplitz', preprocess = True, cond_thresh = None, timeout = 30, progress_callback = None, library_trace = None, library_oxygenation = True, library_traces = None, library_uncovered = 'skip', drop_failed_channels = True):
@@ -889,6 +912,33 @@ class montage(tree):
                 self.channels['global_hbo'] = self.insert(global_hrf)
             else:
                 self.channels['global_hbr'] = self.insert(global_hrf)
+
+    def remove_source(self, source_id, regenerate = True):
+        """Drop every estimate contributed by ``source_id`` from all channels.
+
+        Provenance-based removal for a multi-subject montage — e.g. drop one
+        subject from a group montage (including one saved then reloaded, since
+        ``estimate_sources`` round-trips through save/load). Keeps estimates /
+        locations / estimate_sources parallel. When ``regenerate`` (default),
+        re-runs ``generate_distribution`` so trace + trace_std reflect the
+        remaining subjects. Returns the number of estimates removed.
+        """
+        removed = 0
+        for optode in self.channels.values():
+            sources = getattr(optode, 'estimate_sources', None)
+            if not sources:
+                continue
+            for idx in reversed([
+                i for i, s in enumerate(sources) if s == source_id
+            ]):
+                del optode.estimates[idx]
+                if idx < len(optode.locations):
+                    del optode.locations[idx]
+                del optode.estimate_sources[idx]
+                removed += 1
+        if regenerate and removed:
+            self.generate_distribution()
+        return removed
 
     def correlate_hrf(self, plot_filename = "montage_correlation.png"):
         """

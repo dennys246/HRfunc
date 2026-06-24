@@ -51,31 +51,34 @@ class TestBuildProjectMontage:
     def test_pools_estimates_and_makes_std_nonzero(self):
         m1 = _FakeMontage({"s1_d1_hbo": [1.0, 2.0, 3.0]})
         m2 = _FakeMontage({"s1_d1_hbo": [3.0, 4.0, 5.0]})
-        group = hrf_panel._build_project_montage([m1, m2])
+        group = hrf_panel._build_project_montage([("subjA", m1), ("subjB", m2)])
         node = group.channels["s1_d1_hbo"]
         assert len(node.estimates) == 2          # both subjects pooled
         assert np.allclose(node.trace, [2.0, 3.0, 4.0])   # between-subject mean
         assert np.all(node.trace_std > 0)        # real between-subject std
+        # Provenance: each pooled estimate tagged by its source scan.
+        assert node.estimate_sources == ["subjA", "subjB"]
 
     def test_unions_channels_across_subjects(self):
         m1 = _FakeMontage({"s1_d1_hbo": [1.0, 1.0]})
         m2 = _FakeMontage({"s1_d1_hbo": [3.0, 3.0], "s2_d1_hbo": [9.0, 9.0]})
-        group = hrf_panel._build_project_montage([m1, m2])
+        group = hrf_panel._build_project_montage([("a", m1), ("b", m2)])
         # Channel only subject 2 had still appears (with its one estimate).
         assert "s2_d1_hbo" in group.channels
         assert len(group.channels["s2_d1_hbo"].estimates) == 1
+        assert group.channels["s2_d1_hbo"].estimate_sources == ["b"]
 
     def test_none_when_empty_or_canonical_only(self):
         assert hrf_panel._build_project_montage([]) is None
         canon = hrf_panel._CanonicalResult(
             canonical_trace=np.zeros(5), duration=1.0, sfreq=10.0
         )
-        assert hrf_panel._build_project_montage([canon]) is None
+        assert hrf_panel._build_project_montage([("c", canon)]) is None
 
     def test_does_not_mutate_source_montages(self):
         m1 = _FakeMontage({"s1_d1_hbo": [1.0, 2.0]})
         m2 = _FakeMontage({"s1_d1_hbo": [3.0, 4.0]})
-        hrf_panel._build_project_montage([m1, m2])
+        hrf_panel._build_project_montage([("a", m1), ("b", m2)])
         # Sources keep their single estimate (pooling worked on a copy).
         assert len(m1.channels["s1_d1_hbo"].estimates) == 1
         assert len(m2.channels["s1_d1_hbo"].estimates) == 1
@@ -160,3 +163,20 @@ class TestGroupSubjects:
             )
         )
         assert hrf_panel._group_subject_names(state) == ["subj-A"]
+
+
+class TestGroupExclusion:
+    def test_excluding_a_subject_drops_it_from_the_pool(self):
+        from pathlib import Path
+        state = AppState()
+        state.montage_cache[Path("/a")] = _FakeMontage({"c": [1.0, 1.0]})
+        state.montage_cache[Path("/b")] = _FakeMontage({"c": [3.0, 3.0]})
+        state.montage_cache[Path("/c")] = _FakeMontage({"c": [5.0, 5.0]})
+        hrf_panel._rebuild_project_montage(state)
+        assert len(state.project_montage.channels["c"].estimates) == 3
+
+        state.project_group_excluded.add(Path("/b"))
+        hrf_panel._rebuild_project_montage(state)
+        node = state.project_montage.channels["c"]
+        assert len(node.estimates) == 2
+        assert "/b" not in node.estimate_sources   # provenance reflects removal

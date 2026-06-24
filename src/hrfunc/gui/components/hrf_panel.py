@@ -475,10 +475,11 @@ def _render_body(state: AppState, opts: EstimationOptions) -> None:
 
 
 def _project_montages(state: AppState) -> list:
-    """Real per-scan montages from the cache (skips canonical results)."""
+    """Real per-scan montages in the group pool (skips canonical + excluded)."""
     return [
-        m for m in state.montage_cache.values()
+        m for path, m in state.montage_cache.items()
         if m is not None and not isinstance(m, _CanonicalResult)
+        and path not in state.project_group_excluded
     ]
 
 
@@ -486,44 +487,47 @@ def _project_subject_count(state: AppState) -> int:
     return len(_project_montages(state))
 
 
-def _build_project_montage(montages: list):
-    """Pool per-scan montages into one GROUP montage.
+def _build_project_montage(sourced_montages: list):
+    """Pool per-scan montages into one GROUP montage, tagging provenance.
 
-    Each group channel collects EVERY contributing subject's estimate, then
-    ``generate_distribution`` re-means/re-stds across them — so ``trace_std``
-    becomes the genuine between-subject variability (a single scan's montage
-    has one estimate → std 0). Returns None when nothing poolable.
-
-    Reuses the cached per-scan montages (keyed by scan path), so re-estimating
-    a scan replaces its contribution on the next rebuild with no double count,
-    and no re-estimation is needed here. Duck-typed (``.channels`` of nodes
-    with ``.estimates`` + a ``.generate_distribution()``) so tests can pass
+    ``sourced_montages`` is a list of ``(source_id, montage)`` pairs. Each group
+    channel collects EVERY contributing subject's estimate (tagging each with
+    its ``source_id`` in ``estimate_sources``), then ``generate_distribution``
+    re-means/re-stds across them — so ``trace_std`` becomes the genuine
+    between-subject variability (a single scan's montage has one estimate → std
+    0). Tagging lets a saved+reloaded group montage still report / remove a
+    specific subject (see ``montage.remove_source``). Returns None when nothing
+    poolable. Duck-typed (``.channels`` of nodes with ``.estimates`` /
+    ``.estimate_sources`` + a ``.generate_distribution()``) so tests can pass
     lightweight fakes.
     """
     import copy
 
     real = [
-        m for m in montages
+        (sid, m) for sid, m in sourced_montages
         if m is not None and not isinstance(m, _CanonicalResult)
     ]
     if not real:
         return None
 
-    group = copy.deepcopy(real[0])
+    group = copy.deepcopy(real[0][1])
     # Union of channels: graft in any channel present in a later subject but
     # absent from the base (heterogeneous montage layouts across subjects).
-    for m in real[1:]:
+    for _sid, m in real[1:]:
         for ch, node in getattr(m, "channels", {}).items():
             if ch not in group.channels:
                 group.channels[ch] = copy.deepcopy(node)
-    # Pool every subject's estimate into each channel.
+    # Pool every subject's estimate into each channel, tagged by source.
     for ch, gnode in group.channels.items():
-        pooled = []
-        for m in real:
+        pooled, sources = [], []
+        for sid, m in real:
             other = getattr(m, "channels", {}).get(ch)
             if other is not None and getattr(other, "estimates", None):
-                pooled.extend(other.estimates)
+                for est in other.estimates:
+                    pooled.append(est)
+                    sources.append(sid)
         gnode.estimates = pooled
+        gnode.estimate_sources = sources
     try:
         group.generate_distribution()
     except Exception as exc:  # noqa: BLE001 — never break the panel on a pool error
@@ -532,9 +536,21 @@ def _build_project_montage(montages: list):
     return group
 
 
+def _sourced_project_montages(state: AppState) -> list:
+    """``(source_id, montage)`` pairs for the group pool — source id is the
+    scan's resolved path string (stable, unique, survives manifest rebuilds)."""
+    return [
+        (str(path), m) for path, m in state.montage_cache.items()
+        if m is not None and not isinstance(m, _CanonicalResult)
+        and path not in state.project_group_excluded
+    ]
+
+
 def _rebuild_project_montage(state: AppState) -> None:
     """Refresh ``state.project_montage`` from the current per-scan cache."""
-    state.project_montage = _build_project_montage(_project_montages(state))
+    state.project_montage = _build_project_montage(
+        _sourced_project_montages(state)
+    )
 
 
 def _render_preview_view_toggle(state: AppState, n_subjects: int) -> None:
@@ -559,6 +575,7 @@ def _group_subject_names(state: AppState) -> list:
     contributing = {
         path for path, m in state.montage_cache.items()
         if m is not None and not isinstance(m, _CanonicalResult)
+        and path not in state.project_group_excluded
     }
     by_path = {}
     if state.manifest is not None:
@@ -599,16 +616,66 @@ async def _save_group_montage(state: AppState) -> None:
         ui.notify(state.last_error, type="negative")
 
 
+def _group_subject_entries(state: AppState) -> list:
+    """``(path, name, excluded)`` for every non-canonical cached scan."""
+    by_path = {}
+    if state.manifest is not None:
+        by_path = {s.path.resolve(): s for s in state.manifest.scans}
+    out = []
+    for path, m in state.montage_cache.items():
+        if m is None or isinstance(m, _CanonicalResult):
+            continue
+        scan = by_path.get(path)
+        name = (scan.display_name or scan.path.name) if scan else path.stem
+        out.append((path, name, path in state.project_group_excluded))
+    return sorted(out, key=lambda e: e[1])
+
+
+def _set_group_excluded(state: AppState, path, excluded: bool) -> None:
+    if excluded:
+        state.project_group_excluded.add(path)
+    else:
+        state.project_group_excluded.discard(path)
+    _rebuild_project_montage(state)
+    state.publish("hrf_selection_changed")
+
+
 def _render_group_subjects(state: AppState) -> None:
-    """Contributing-subjects readout + a Save-group action for the group view."""
-    names = _group_subject_names(state)
-    if names:
-        shown = ", ".join(names[:8]) + (
-            f", +{len(names) - 8} more" if len(names) > 8 else ""
-        )
-        ui.label(f"Contributing scans: {shown}").classes(
-            "text-xs opacity-60 break-all"
-        )
+    """Contributing-subjects readout, per-subject remove/restore, + Save."""
+    entries = _group_subject_entries(state)
+    included = [e for e in entries if not e[2]]
+    excluded = [e for e in entries if e[2]]
+
+    ui.label(f"Contributing scans ({len(included)})").classes(
+        "text-xs uppercase opacity-60 tracking-wide"
+    )
+    with ui.row().classes("items-center gap-1 flex-wrap"):
+        for path, name, _ in included:
+            with ui.row().classes(
+                "items-center gap-1 px-2 py-0.5 rounded bg-slate-700/40"
+            ):
+                ui.label(name).classes("text-xs")
+                # Keep at least 2 subjects so it stays a group (and the view +
+                # restore controls remain reachable).
+                if len(included) > 2:
+                    ui.button(
+                        icon="close",
+                        on_click=lambda p=path: _set_group_excluded(
+                            state, p, True
+                        ),
+                    ).props("flat dense round size=xs").tooltip(
+                        "Remove this subject from the group"
+                    )
+
+    if excluded:
+        with ui.row().classes("items-center gap-2 flex-wrap"):
+            ui.label(
+                "Excluded: " + ", ".join(e[1] for e in excluded)
+            ).classes("text-xs opacity-50")
+            ui.button(
+                "Restore all",
+                on_click=lambda: _set_group_excluded_restore_all(state),
+            ).props("flat dense size=xs color=primary")
 
     async def _on_save() -> None:
         await _save_group_montage(state)
@@ -621,6 +688,12 @@ def _render_group_subjects(state: AppState) -> None:
             "Saves the pooled multi-subject HRFs (mean + std) as a "
             "tree.load_hrfs JSON — the submission form below can share it."
         ).classes("text-xs opacity-50")
+
+
+def _set_group_excluded_restore_all(state: AppState) -> None:
+    state.project_group_excluded.clear()
+    _rebuild_project_montage(state)
+    state.publish("hrf_selection_changed")
 
 
 def _render_preview_column(

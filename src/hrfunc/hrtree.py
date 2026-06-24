@@ -649,7 +649,8 @@ class tree:
                     "sfreq": node.sfreq,
                     "context": node.context,
                     "estimates": node.estimates,
-                    "locations": node.locations
+                    "locations": node.locations,
+                    "estimate_sources": getattr(node, "estimate_sources", []),
                 }
         }
         return hrfs
@@ -908,7 +909,7 @@ class tree:
         return min([node, left_min, right_min], key=lambda n: getattr(n, ["x", "y", "z"][axis]) if n else float('inf'))
 
 class HRF:
-    def __init__(self, doi, ch_name, duration, sfreq, trace, trace_std = None, location = None, estimates = None, locations = None, context = None, **kwargs):
+    def __init__(self, doi, ch_name, duration, sfreq, trace, trace_std = None, location = None, estimates = None, locations = None, context = None, estimate_sources = None, **kwargs):
         """
         Object for storing all information apart of an estimated HRF from an fNIRS optode
 
@@ -986,6 +987,18 @@ class HRF:
 
         self.estimates = list(estimates) if estimates is not None else []
         self.locations = list(locations) if locations is not None else []
+        # Provenance: a source id per estimate (e.g. the scan it came from), so
+        # a saved+reloaded multi-subject montage can still report and remove a
+        # specific subject's contribution. Kept parallel to ``estimates`` — pad
+        # with None for estimates that predate provenance (bundled HRFs, older
+        # saves) so indices always line up.
+        self.estimate_sources = (
+            list(estimate_sources) if estimate_sources is not None else []
+        )
+        if len(self.estimate_sources) < len(self.estimates):
+            self.estimate_sources += [None] * (
+                len(self.estimates) - len(self.estimate_sources)
+            )
 
         # NE-003: process_options must be the same length as hrf_processes
         # and process_names so the zip in build() produces one iteration

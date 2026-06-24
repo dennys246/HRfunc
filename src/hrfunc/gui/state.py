@@ -303,6 +303,11 @@ class AppState:
     # subjects exist, so a single-subject project still shows that scan's HRFs.
     project_montage: Optional[Any] = None
     hrf_preview_group: bool = True
+    # Resolved scan paths the user has excluded from the group montage (the
+    # in-session "remove subject" control). Filtered out of the pool when the
+    # group montage is rebuilt; kept separate from ``montage_cache`` so the
+    # per-scan HRFs stay available for single-scan / Activity use.
+    project_group_excluded: Set[Path] = field(default_factory=set)
     # When True, the Activity tab's toeplitz source deconvolves EVERY scan with
     # the pooled ``project_montage`` (group HRFs, matched by channel name)
     # instead of each scan's own estimated HRFs. Lets a user apply a group HRF
@@ -842,6 +847,7 @@ class AppState:
         self.montage_cache.clear()
         self.project_montage = None
         self.hrf_preview_group = True
+        self.project_group_excluded.clear()
         self.activity_use_group_hrfs = False
         self.preload_path = None
         self.busy = False
