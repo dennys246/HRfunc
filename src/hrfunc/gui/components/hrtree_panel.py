@@ -483,7 +483,7 @@ def _ensure_shift_tracker_injected() -> None:
     _PAINT_HOOK_HEAD_INJECTED = True
 
 
-def _install_paint_hook(plot_id: int) -> None:
+def _install_paint_hook(plot_id: int, anchor=None) -> None:
     """Hook the freshly-rendered plotly element's ``plotly_hover`` event.
 
     Plotly's native hover event includes the points data; what we need
@@ -493,7 +493,11 @@ def _install_paint_hook(plot_id: int) -> None:
     handler via the element's ``$emit``.
 
     A small ``ui.timer`` delay gives plotly's render cycle time to attach
-    the underlying div to the DOM before we query it.
+    the underlying div to the DOM before we query it. The timer is parked on
+    ``anchor`` (a stable element OUTSIDE the refreshable viz body) when given,
+    so a rapid ``_viz_body.refresh()`` — e.g. the user clicking through HRFs
+    faster than 0.5 s — can't delete the slot the pending timer lives in and
+    crash it with "parent slot of the element has been deleted".
     """
     _ensure_shift_tracker_injected()
 
@@ -511,7 +515,12 @@ if (el && el.on && !el._hrfPaintHooked) {{
 }}
 """
 
-    ui.timer(0.5, lambda: ui.run_javascript(js), once=True)
+    cb = lambda: ui.run_javascript(js)  # noqa: E731
+    if anchor is not None and not anchor.is_deleted:
+        with anchor:
+            ui.timer(0.5, cb, once=True)
+    else:
+        ui.timer(0.5, cb, once=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1847,6 +1856,14 @@ def _render_viz_pane(state: AppState) -> None:
     after the first call so the body fills the available height.
     """
 
+    # Stable, zero-footprint anchor for deferred ``once=True`` timers (the
+    # plotly resize hook + the on-selection viz re-centre). It lives OUTSIDE
+    # ``_viz_body`` so a ``_viz_body.refresh()`` can't delete the slot a
+    # pending timer is parented to — which is what raised "parent slot of the
+    # element has been deleted" when clicking through HRFs quickly.
+    _deferred_anchor = ui.element("div").style("display:none")
+    _pending_viz_timer: dict = {"timer": None}
+
     @ui.refreshable
     def _viz_body() -> None:
         all_hrfs = gather_library_hrfs(state)
@@ -1970,7 +1987,7 @@ def _render_viz_pane(state: AppState) -> None:
             # plotly element has rendered. Slight delay so the
             # underlying div is queryable in the DOM. once=True so
             # the hook isn't registered repeatedly on each refresh.
-            _install_paint_hook(plot.id)
+            _install_paint_hook(plot.id, _deferred_anchor)
 
             # MNI overlay toggles under the viz — they control what's
             # rendered above (brain mesh, scalp mesh), so visual
@@ -2054,9 +2071,22 @@ def _render_viz_pane(state: AppState) -> None:
         # pane (which refreshes later in the same ``publish``) then wouldn't
         # repaint until the user's NEXT interaction (e.g. toggling a switch).
         # Deferring lets the click event finish and flush first, then we
-        # rebuild the viz to re-centre the ROI shape overlay on the new
-        # anchor. once=True so the timer cleans itself up after firing.
-        ui.timer(0.05, _refresh_viz, once=True)
+        # rebuild the viz to re-centre the ROI shape overlay on the new anchor.
+        #
+        # Cancel any still-pending deferred refresh first: clicking through
+        # HRFs faster than 0.05 s would otherwise stack timers, and a fired
+        # one's ``_viz_body.refresh()`` could delete a sibling timer's slot
+        # mid-flight. The timer is parked on the stable ``_deferred_anchor``
+        # (not the refreshable body) so it survives the rebuild it triggers.
+        prev = _pending_viz_timer["timer"]
+        if prev is not None and not prev.is_deleted:
+            prev.cancel()
+        if _deferred_anchor.is_deleted:
+            return
+        with _deferred_anchor:
+            _pending_viz_timer["timer"] = ui.timer(
+                0.05, _refresh_viz, once=True
+            )
 
     state.subscribe("hrtree_filter_changed", _refresh_viz)
     # Selection comes from a plotly click inside this body, so defer (above).
