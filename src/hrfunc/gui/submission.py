@@ -11,9 +11,12 @@ have to context-switch to a browser to share their work:
   hrfunc-web's ``/upload_json`` endpoint, which then validates, rate-
   limits, forwards to the canonical backend, and sends the
   confirmation email.
-- :func:`check_hrserv_health` polls HRServ's ``/healthz`` so the panel
-  can surface an "Accepting HRF Submissions" pill (mirrors the web
-  form's JS-driven status pill).
+- :func:`check_hrserv_health` probes ONE HRServ node's ``/healthz``;
+  :func:`check_submission_health` aggregates the primary + standby into
+  the single "Accepting HRF Submissions" pill (mirrors the web form's
+  JS-driven status pill). The pill is green only when some node is an
+  accepting write ``primary`` -- a reachable-but-replica node 503s every
+  upload, so reachability alone must never show green.
 - :func:`render_submission_panel` renders the NiceGUI form. Caller
   drops it on the Export tab (always) and on the HRFs tab (after a
   successful estimation) so the submission flow is reachable from
@@ -24,7 +27,9 @@ environment variable -- matches hrfunc-web's own override pattern so
 the same variable means the same thing in both clients. Default
 target is the production deployment at hrfunc-web. The health
 endpoint similarly overridable via ``HRFUNC_HEALTH_URL``; defaults to
-``https://api.hrfunc.org/healthz`` (HRServ's public health route).
+``https://api.hrfunc.org/healthz`` (HRServ's public health route). The
+standby node's route is overridable via ``HRFUNC_REPLICA_HEALTH_URL``;
+defaults to ``https://hrserv-2.hrfunc.org/healthz``.
 
 What lives where:
 
@@ -63,6 +68,11 @@ DEFAULT_UPLOAD_URL = "https://www.hrfunc.org/upload_json"
 # two clients consistent so a HRServ outage looks identical from
 # either entry point.
 DEFAULT_HEALTH_URL = "https://api.hrfunc.org/healthz"
+
+# The standby ("mirror") node's health route. Polled independently of the
+# primary and surfaced as a quiet, ops-facing secondary line under the main
+# pill -- end users care about the primary; this is context for us.
+DEFAULT_REPLICA_HEALTH_URL = "https://hrserv-2.hrfunc.org/healthz"
 
 # Base URL of hrfunc-web. The submission flow's context-field labels
 # link into its ``/experimental_contexts`` page so users can read
@@ -125,21 +135,31 @@ HEALTH_TIMEOUT_S = 5.0
 
 
 class HealthState(str, enum.Enum):
-    """Three discriminable states the health pill can render in.
+    """States the health pill can render in.
 
     String values so the panel can pass them straight to NiceGUI's
     class-string attribute without an explicit conversion.
 
     - ``CHECKING``: poll in flight (or panel just mounted, no poll
       result yet). Grey pill with neutral copy.
-    - ``OK``: HRServ returned HTTP 200. Green pill, "Accepting HRF
-      Submissions" copy.
-    - ``DOWN``: HRServ returned a non-200, or the request raised a
-      transport exception. Red pill, "Submission system down" copy.
+    - ``OK``: HRServ returned HTTP 200 AND reports a live DB while acting
+      as the write ``primary``. Green pill, "Accepting HRF Submissions".
+    - ``DEGRADED``: HRServ is reachable and healthy but is NOT the write
+      primary (e.g. running as a replica under the production hostname
+      after a failed promotion, or its DB ping is down). Uploads 503 in
+      this state, so a green pill would be a lie. Yellow pill,
+      "Submissions paused — maintenance".
+    - ``DOWN``: HRServ returned a non-200, the body was unreadable, or the
+      request raised a transport exception. Red pill, "Submission system
+      down" copy.
+
+    Also reused for the standby/mirror node's line, which only ever uses
+    ``CHECKING`` / ``OK`` / ``DOWN``.
     """
 
     CHECKING = "checking"
     OK = "ok"
+    DEGRADED = "degraded"
     DOWN = "down"
 
 
@@ -311,37 +331,103 @@ def health_url() -> str:
     return os.environ.get("HRFUNC_HEALTH_URL", DEFAULT_HEALTH_URL)
 
 
+def replica_health_url() -> str:
+    """Return the standby (mirror) node's ``/healthz`` URL.
+
+    Honors the ``HRFUNC_REPLICA_HEALTH_URL`` env var; defaults to
+    ``https://hrserv-2.hrfunc.org/healthz``. Same override rationale as
+    :func:`health_url` -- point the desktop at a staging standby during
+    integration testing.
+    """
+    return os.environ.get(
+        "HRFUNC_REPLICA_HEALTH_URL", DEFAULT_REPLICA_HEALTH_URL
+    )
+
+
 def check_hrserv_health(
     *,
     target_url: Optional[str] = None,
     timeout_s: float = HEALTH_TIMEOUT_S,
 ) -> HealthState:
-    """Probe HRServ's healthz endpoint and map the response to a state.
+    """Probe ONE HRServ node's healthz endpoint and map it to a state.
 
-    Mirrors what the hrfunc-web JS pill does: GET, treat HTTP 200 as
-    ``OK``, anything else (non-200 response, transport exception) as
-    ``DOWN``. No retries -- the panel timer re-fires on the same
-    interval (60 s by default) so a transient blip auto-recovers
-    without us building a backoff ladder here.
+    Per-node probe -- :func:`check_submission_health` calls this for both
+    the primary and the standby and aggregates them into the pill state.
+    GET, then read the health document.
+
+    - non-200, unreadable body, or a transport exception -> ``DOWN``
+    - 200 with ``db`` truthy AND ``node_role == "primary"`` -> ``OK``
+    - 200 otherwise -> ``DEGRADED``
+
+    The ``DEGRADED`` branch is the important one: a node can be perfectly
+    healthy yet running as a REPLICA under the production hostname (a
+    botched promotion, or the boot chain reverting its role). In that
+    state every upload 503s while a plain "is it up?" check stays green --
+    so keying the pill off the status code alone would actively lie to the
+    user. ``node_role`` lets us tell "up" from "able to accept writes".
+
+    No retries -- the panel timer re-fires on the same interval (60 s by
+    default) so a transient blip auto-recovers without a backoff ladder.
 
     ``target_url`` defaults to :func:`health_url` (env-var override
     aware). Tests pass an explicit URL to point at a mock server.
-
-    HEAD would be more efficient (HRServ's route accepts it) but
-    requests' default ``redirect`` behavior strips the body on GET
-    when the response is HEAD-style anyway, and using GET keeps the
-    code identical to the web form's ``fetch(URL)``. Symmetry between
-    the two clients matters more than the tiny bandwidth win.
     """
     import requests
 
     url = target_url or health_url()
     try:
         response = requests.get(url, timeout=timeout_s)
-    except Exception as exc:  # noqa: BLE001 -- mirror JS fetch's
-        logger.debug("check_hrserv_health: transport error: %s", exc)
+        if response.status_code != 200:
+            return HealthState.DOWN
+        body = response.json()
+    except Exception as exc:  # noqa: BLE001 -- mirror JS fetch's catch-all
+        logger.debug("check_hrserv_health: unreachable/unreadable: %s", exc)
         return HealthState.DOWN
-    return HealthState.OK if response.status_code == 200 else HealthState.DOWN
+
+    if (
+        isinstance(body, dict)
+        and body.get("db")
+        and body.get("node_role") == "primary"
+    ):
+        return HealthState.OK
+    # Reachable + 200 but not a confirmed write primary: uploads will 503.
+    return HealthState.DEGRADED
+
+
+def check_submission_health(
+    *,
+    primary_url: Optional[str] = None,
+    replica_url: Optional[str] = None,
+    timeout_s: float = HEALTH_TIMEOUT_S,
+) -> HealthState:
+    """Aggregate BOTH HRServ nodes into the single pill state.
+
+    The pill answers one question: *can the user submit right now?* So it's
+    keyed off whether some node is actually accepting writes, not merely
+    whether something responds:
+
+    - ``OK``: EITHER node reports a live DB while acting as the write
+      ``primary``. Covers a failover where ``hrserv-2`` has been promoted --
+      it reports ``node_role == "primary"`` and submissions genuinely work.
+    - ``DEGRADED``: at least one node is reachable, but NEITHER is an
+      accepting write primary. This is the nasty case -- a healthy node
+      running as a replica under the production hostname answers 200 while
+      every upload 503s. Reachability alone must never turn the pill green.
+    - ``DOWN``: neither node is reachable.
+
+    Both nodes are probed with the same :func:`check_hrserv_health`
+    predicate precisely because either one can be the primary at any time.
+    """
+    primary = check_hrserv_health(target_url=primary_url, timeout_s=timeout_s)
+    replica = check_hrserv_health(
+        target_url=replica_url or replica_health_url(), timeout_s=timeout_s
+    )
+    states = (primary, replica)
+    if HealthState.OK in states:
+        return HealthState.OK
+    if HealthState.DEGRADED in states:
+        return HealthState.DEGRADED
+    return HealthState.DOWN
 
 
 @dataclass
@@ -591,10 +677,10 @@ def render_submission_panel(state, *, default_path: Optional[Path] = None) -> No
         ).classes("text-xs opacity-60 italic")
 
         # --- HRServ health pill ---------------------------------------
-        # Mirrors the hrfunc-web JS pill at the top of /hrf_upload.
-        # Three states: checking / ok / down. Polls every
+        # One pill aggregating BOTH nodes (see check_submission_health).
+        # Four states: checking / ok / degraded / down. Polls every
         # ``HEALTH_POLL_INTERVAL_S`` (default 60 s) so a state change
-        # surfaces within a minute without us hammering the endpoint.
+        # surfaces within a minute without us hammering the endpoints.
         _render_health_pill(health_state["value"])
 
         # --- File selector --------------------------------------------
@@ -852,7 +938,8 @@ def render_submission_panel(state, *, default_path: Optional[Path] = None) -> No
         import asyncio
 
         loop = asyncio.get_event_loop()
-        new_state = await loop.run_in_executor(None, check_hrserv_health)
+        # One aggregate probe across both nodes (primary + standby).
+        new_state = await loop.run_in_executor(None, check_submission_health)
         if new_state == health_state["value"]:
             return  # No change -- skip the refresh to avoid render churn.
         health_state["value"] = new_state
@@ -869,18 +956,20 @@ def render_submission_panel(state, *, default_path: Optional[Path] = None) -> No
 def _render_health_pill(state: HealthState) -> None:
     """Render a coloured pill mirroring hrfunc-web's status indicator.
 
-    Three visual states keyed off :class:`HealthState`:
+    Four visual states keyed off :class:`HealthState`:
 
     - ``CHECKING``: neutral grey, "Checking submission status…"
     - ``OK``: green, "Accepting HRF submissions"
+    - ``DEGRADED``: yellow, "Submissions paused — maintenance" (healthy
+      node that isn't the write primary; uploads 503)
     - ``DOWN``: red, "Submission system down"
 
     Class strings follow the same Tailwind palette as the web pill
     so the two clients are visually consistent. The web pill is
     just a coloured dot + status text; the desktop pill matches
     that exact pattern (no Material icon -- the dot's colour is
-    the affordance, and the colour shift between gray / green / red
-    is recognisable without a separate iconographic cue).
+    the affordance, and the colour shift between gray / green /
+    yellow / red is recognisable without a separate iconographic cue).
     """
     from nicegui import ui
 
@@ -888,6 +977,16 @@ def _render_health_pill(state: HealthState) -> None:
         bg = "bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-200"
         dot = "bg-green-500"
         text = "Accepting HRF submissions"
+    elif state == HealthState.DEGRADED:
+        bg = (
+            "bg-yellow-100 text-yellow-800 "
+            "dark:bg-yellow-900/40 dark:text-yellow-200"
+        )
+        dot = "bg-yellow-500"
+        text = (
+            "Submissions paused — maintenance. The server is up but isn't "
+            "accepting uploads right now; try again shortly."
+        )
     elif state == HealthState.DOWN:
         bg = "bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-200"
         dot = "bg-red-500"
