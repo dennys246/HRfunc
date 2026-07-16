@@ -54,3 +54,34 @@
   download is required.
 - See [docs/external/gui_guide.md](docs/external/gui_guide.md) for the
   full GUI walkthrough and troubleshooting guide
+
+## v1.3.1
+- Fix (packaging, affects all v1.3.0 installs): the bundled HRF library
+  was missing from the published wheel and sdist, so `pip install
+  hrfunc` shipped an empty library. The `/library` HRtree explorer
+  showed no HRFs and library-backed activity estimation had nothing to
+  match against. This failed silently — `tree()` treats an absent file
+  as "no HRFs loaded" rather than an error, so it only reproduced on a
+  pip install, never from a source checkout. Anyone on v1.3.0 should
+  upgrade.
+- Fix: single-scan activity Save could write the *wrong* scan's data;
+  saving is now gated on the result belonging to the selected scan,
+  matching the preview's predicate.
+- Fix: Activity group-HRF count ignored excluded subjects, so it could
+  report "GROUP HRFs (N)" and pass the >=2 gate on a pool that excluded
+  a subject.
+- Fix: an empty single-scan estimate (activity or HRF) left the previous
+  scan's result on screen with no error shown.
+- Fix: cross-project state leak, ROI-save mixing, and an atlas lookup
+  crash, plus a second review sweep across workflow / edge-case /
+  scientific-guidance lenses.
+- Fix: the 4 long-standing test failures are resolved at root cause; the
+  suite is now fully green (1166 passing).
+- New: bulk "Save all activity" lets you pick a destination folder
+  instead of writing next to each source file — the escape hatch when
+  the source dataset lives on a read-only or mounted volume, which
+  previously dead-ended every save. Flat-folder name collisions are
+  disambiguated rather than silently overwritten.
+- New: the submission health pill honors HRServ `node_role` — a healthy
+  node running as a replica no longer shows green while every upload
+  fails. Adds a DEGRADED state and aggregates both nodes into one pill.

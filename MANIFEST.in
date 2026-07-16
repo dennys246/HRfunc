@@ -1,3 +1,8 @@
 include README.md
 include LICENSE
-recursive-include src/hrfunc/data *
+# Bundled runtime data. src/hrfunc/data was renamed long ago; the stale
+# rule silently matched nothing. Package data is declared authoritatively
+# in pyproject.toml [tool.setuptools.package-data] -- these rules only
+# ensure the sdist carries the same files.
+recursive-include src/hrfunc/hrfs *.json
+recursive-include src/hrfunc/assets *
