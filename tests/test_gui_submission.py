@@ -18,6 +18,7 @@ pytest.importorskip("nicegui")
 
 from hrfunc.gui.submission import (  # noqa: E402
     DEFAULT_HEALTH_URL,
+    DEFAULT_REPLICA_HEALTH_URL,
     DEFAULT_UPLOAD_URL,
     EXPERIMENTAL_CONTEXT_ANCHORS,
     HRFUNC_WEB_BASE_URL,
@@ -26,10 +27,14 @@ from hrfunc.gui.submission import (  # noqa: E402
     SubmissionResult,
     _experimental_context_url,
     check_hrserv_health,
+    check_submission_health,
     health_url,
+    replica_health_url,
     submit_payload,
     upload_url,
 )
+
+pytest_plugins = ["nicegui.testing.user_plugin"]
 
 
 # ---------------------------------------------------------------------------
@@ -206,12 +211,26 @@ class TestSubmitPayloadPreflight:
 
 
 class _FakeResponse:
-    """Stand-in for ``requests.Response`` -- only the two fields the
-    helper reads. Module-level so all three failure-bucket tests share
-    one shape."""
-    def __init__(self, status_code=200, text="OK"):
+    """Stand-in for ``requests.Response`` -- only the fields the helpers
+    read. Module-level so the failure-bucket tests share one shape.
+
+    ``.json()`` parses ``text`` (so a non-JSON body raises, exactly like
+    ``requests`` does) unless an explicit ``json_body`` is supplied.
+    """
+    def __init__(self, status_code=200, text="OK", json_body=None):
         self.status_code = status_code
         self.text = text
+        self._json_body = json_body
+
+    def json(self):
+        if self._json_body is not None:
+            return self._json_body
+        return json.loads(self.text)
+
+
+def _primary_body(db=True, role="primary") -> dict:
+    """A healthz document from a node acting as the write primary."""
+    return {"db": db, "node_role": role}
 
 
 class TestSubmitPayloadHappyPath:
@@ -328,11 +347,55 @@ class TestHealthUrl:
 
 
 class TestCheckHrservHealth:
-    """``check_hrserv_health`` maps the GET /healthz response to a
-    three-state enum -- the same three states the hrfunc-web JS pill
-    shows. Tests pin each branch via a monkey-patched ``requests.get``."""
+    """``check_hrserv_health`` maps ONE node's GET /healthz response to a
+    four-state enum -- the same states the hrfunc-web JS pill shows. Tests
+    pin each branch via a monkey-patched ``requests.get``."""
 
-    def test_200_returns_ok(self, monkeypatch):
+    def test_200_write_primary_returns_ok(self, monkeypatch):
+        """Green requires BOTH a live DB and the write-primary role."""
+        import requests
+
+        def _fake_get(url, timeout=None):
+            return _FakeResponse(status_code=200, json_body=_primary_body())
+
+        monkeypatch.setattr(requests, "get", _fake_get)
+        assert check_hrserv_health(
+            target_url="http://test.local/healthz",
+        ) == HealthState.OK
+
+    def test_200_replica_role_returns_degraded(self, monkeypatch):
+        """THE key case: a healthy node running as a replica under the
+        production hostname answers 200, but every upload 503s. Must be
+        DEGRADED (yellow), never a green 'accepting submissions' lie."""
+        import requests
+
+        def _fake_get(url, timeout=None):
+            return _FakeResponse(
+                status_code=200, json_body=_primary_body(role="replica")
+            )
+
+        monkeypatch.setattr(requests, "get", _fake_get)
+        assert check_hrserv_health(
+            target_url="http://test.local/healthz",
+        ) == HealthState.DEGRADED
+
+    def test_200_db_down_returns_degraded(self, monkeypatch):
+        """200 but the DB ping is down -> reachable, not accepting."""
+        import requests
+
+        def _fake_get(url, timeout=None):
+            return _FakeResponse(
+                status_code=200, json_body=_primary_body(db=False)
+            )
+
+        monkeypatch.setattr(requests, "get", _fake_get)
+        assert check_hrserv_health(
+            target_url="http://test.local/healthz",
+        ) == HealthState.DEGRADED
+
+    def test_200_without_role_field_returns_degraded(self, monkeypatch):
+        """An older/unknown health document can't confirm write-primary --
+        stay honest (yellow) rather than assume green."""
         import requests
 
         def _fake_get(url, timeout=None):
@@ -341,7 +404,20 @@ class TestCheckHrservHealth:
         monkeypatch.setattr(requests, "get", _fake_get)
         assert check_hrserv_health(
             target_url="http://test.local/healthz",
-        ) == HealthState.OK
+        ) == HealthState.DEGRADED
+
+    def test_200_unreadable_body_returns_down(self, monkeypatch):
+        """A 200 whose body isn't JSON mirrors the JS pill's caught
+        ``resp.json()`` throw -> DOWN."""
+        import requests
+
+        def _fake_get(url, timeout=None):
+            return _FakeResponse(status_code=200, text="not json at all")
+
+        monkeypatch.setattr(requests, "get", _fake_get)
+        assert check_hrserv_health(
+            target_url="http://test.local/healthz",
+        ) == HealthState.DOWN
 
     def test_503_returns_down(self, monkeypatch):
         """HRServ returns 503 when its DB ping fails -- the panel should
@@ -403,6 +479,146 @@ class TestCheckHrservHealth:
         monkeypatch.setattr(requests, "get", _fake_get)
         check_hrserv_health()
         assert captured["url"] == "http://override.example.com/healthz"
+
+
+class TestRenderHealthPill:
+    """Smoke-render each pill state in a real NiceGUI context. The
+    DEGRADED branch is new, so pin that its copy actually reaches the page
+    (a logic-only test wouldn't catch a broken render)."""
+
+    @pytest.mark.asyncio
+    async def test_degraded_renders_paused_copy(self, user):
+        from nicegui import ui
+
+        from hrfunc.gui.submission import _render_health_pill
+
+        @ui.page("/_pill_degraded")
+        def _p() -> None:
+            _render_health_pill(HealthState.DEGRADED)
+
+        await user.open("/_pill_degraded")
+        await user.should_see("Submissions paused")
+
+    @pytest.mark.asyncio
+    async def test_ok_renders_accepting_copy(self, user):
+        from nicegui import ui
+
+        from hrfunc.gui.submission import _render_health_pill
+
+        @ui.page("/_pill_ok")
+        def _p() -> None:
+            _render_health_pill(HealthState.OK)
+
+        await user.open("/_pill_ok")
+        await user.should_see("Accepting HRF submissions")
+
+    @pytest.mark.asyncio
+    async def test_down_renders_down_copy(self, user):
+        from nicegui import ui
+
+        from hrfunc.gui.submission import _render_health_pill
+
+        @ui.page("/_pill_down")
+        def _p() -> None:
+            _render_health_pill(HealthState.DOWN)
+
+        await user.open("/_pill_down")
+        await user.should_see("Submission system down")
+
+
+class TestReplicaHealthUrl:
+    """``replica_health_url`` mirrors ``health_url`` -- env override with a
+    production default for the standby node."""
+
+    def test_defaults_to_production(self, monkeypatch):
+        monkeypatch.delenv("HRFUNC_REPLICA_HEALTH_URL", raising=False)
+        assert replica_health_url() == DEFAULT_REPLICA_HEALTH_URL
+
+    def test_env_override(self, monkeypatch):
+        monkeypatch.setenv(
+            "HRFUNC_REPLICA_HEALTH_URL", "http://standby.example.com/healthz"
+        )
+        assert replica_health_url() == "http://standby.example.com/healthz"
+
+
+class TestCheckSubmissionHealth:
+    """The single pill aggregates BOTH nodes. It answers 'can I submit
+    right now?' -- so it's green only when SOME node is an accepting write
+    primary, never merely because something responded."""
+
+    @staticmethod
+    def _routed(monkeypatch, primary_resp, replica_resp):
+        """Route GETs to per-node fake responses by URL."""
+        import requests
+
+        def _fake_get(url, timeout=None):
+            if "primary.local" in url:
+                if isinstance(primary_resp, Exception):
+                    raise primary_resp
+                return primary_resp
+            if isinstance(replica_resp, Exception):
+                raise replica_resp
+            return replica_resp
+
+        monkeypatch.setattr(requests, "get", _fake_get)
+
+    def _call(self):
+        return check_submission_health(
+            primary_url="http://primary.local/healthz",
+            replica_url="http://replica.local/healthz",
+        )
+
+    def test_primary_accepting_is_ok(self, monkeypatch):
+        self._routed(
+            monkeypatch,
+            _FakeResponse(200, json_body=_primary_body()),
+            ConnectionError("standby down"),
+        )
+        assert self._call() == HealthState.OK
+
+    def test_promoted_replica_is_ok(self, monkeypatch):
+        """Failover: api is down but hrserv-2 was promoted and reports
+        itself primary -> submissions genuinely work -> green."""
+        self._routed(
+            monkeypatch,
+            ConnectionError("primary down"),
+            _FakeResponse(200, json_body=_primary_body()),
+        )
+        assert self._call() == HealthState.OK
+
+    def test_reachable_but_no_write_primary_is_degraded(self, monkeypatch):
+        """The nasty case: both nodes answer 200 as replicas. Uploads 503,
+        so the pill must be yellow -- NOT green just because they're up."""
+        self._routed(
+            monkeypatch,
+            _FakeResponse(200, json_body=_primary_body(role="replica")),
+            _FakeResponse(200, json_body=_primary_body(role="replica")),
+        )
+        assert self._call() == HealthState.DEGRADED
+
+    def test_one_reachable_replica_one_down_is_degraded(self, monkeypatch):
+        self._routed(
+            monkeypatch,
+            _FakeResponse(200, json_body=_primary_body(role="replica")),
+            ConnectionError("standby down"),
+        )
+        assert self._call() == HealthState.DEGRADED
+
+    def test_neither_reachable_is_down(self, monkeypatch):
+        self._routed(
+            monkeypatch,
+            ConnectionError("primary down"),
+            ConnectionError("standby down"),
+        )
+        assert self._call() == HealthState.DOWN
+
+    def test_both_non_200_is_down(self, monkeypatch):
+        self._routed(
+            monkeypatch,
+            _FakeResponse(503, text='{"status":"degraded"}'),
+            _FakeResponse(503, text='{"status":"degraded"}'),
+        )
+        assert self._call() == HealthState.DOWN
 
 
 # ---------------------------------------------------------------------------
